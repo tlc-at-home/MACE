@@ -1,0 +1,11 @@
+# M.A.C.E. Phase 2 Git Exclusion Rules
+__pycache__/
+*.pyc
+*.log
+crypto/swarm/*.log
+equities/swarm/*.log
+config/portfolio.db
+config/portfolio.db-wal
+config/portfolio.db-shm
+.env
+*.env
