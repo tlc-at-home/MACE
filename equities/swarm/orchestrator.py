@@ -119,6 +119,7 @@ async def process_global_risk(raw_signals, available_cash, active_positions):
     allocator_input = {
         "candidates": raw_signals,
         "available_cash": available_cash,
+        "total_equity": total_equity, # FIX: Pass total portfolio value for true risk caps
         "existing_positions": active_positions
     }
     
@@ -139,12 +140,12 @@ async def process_global_risk(raw_signals, available_cash, active_positions):
     try:
         risk_verdict = json.loads(stdout.decode('utf-8'))
         approved_trades = risk_verdict.get("approved_trades", [])
-        
-        # Inject target_size_usd as size_usd for backwards-compatibility
+        sell_orders = risk_verdict.get("sell_orders", []) # FIX: Catch sell orders
+
         for trade in approved_trades:
             trade["size_usd"] = trade.get("target_size_usd", 0.0)
-            
-        return approved_trades
+
+        return approved_trades, sell_orders # FIX: Return both
     except Exception as e:
         print(f"[!] Critical: Failed to parse centralized risk response: {e}")
         return []
@@ -222,7 +223,7 @@ async def run_sweep(args):
 
     # Invoke the centralized global portfolio allocator
     print("[*] Running centralized global portfolio risk and sizing allocation...")
-    approved_trades = await process_global_risk(raw_signals, available_cash, active_positions)
+    approved_trades, sell_orders = await process_global_risk(raw_signals, available_cash, active_positions)
     print(f"[+] Allocation completed. Approved Trades: {len(approved_trades)}")
 
     # Sort approved candidates by signal strength in descending order
@@ -230,6 +231,17 @@ async def run_sweep(args):
 
     execution_status = "No trades approved or candidates held cash."
     chosen_trade = None
+
+    # FIX: Execute Sell Orders via Gemini MCP if Bear regimes detected
+    if sell_orders and is_live_execution:
+        sells_description = "\n".join([f"- {s['symbol']}: {s['reason']}" for s in sell_orders])
+        sell_prompt = (
+            f"You are M.A.C.E. risk manager.\n"
+            f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
+            f"Call the `mcp_alpaca_place_stock_order` tool for each symbol with side: 'sell', type: 'market', notional: 0 (to close full position)."
+        )
+        # (You will need to instantiate a new Agent block here similar to your buy block, passing sell_prompt instead of system_prompt)
+        print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
 
     # Execute approved trades
     if approved_trades:

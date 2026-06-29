@@ -1,151 +1,96 @@
+#!/usr/bin/env python3.11
+"""
+M.A.C.E. Phase 2 Multi-Agent Architecture Pipeline
+Component: TradFi Equities Shield (tradfi_shield.py)
+"""
+
 import os
+import sys
 import json
 import asyncio
+import argparse
 import logging
 from datetime import datetime
-from paho.mqtt import client as mqtt_client
-from google.antigravity import Agent, LocalAgentConfig, types
+import paho.mqtt.client as mqtt_client
+import alpaca_trade_api as tradeapi
 
-# Configure logging to display SDK and execution logs
-logging.basicConfig(level=logging.INFO)
-
-# ==============================================================================
-# 1. CONFIGURATION & PATH RESOLUTION
-# ==============================================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-os.environ["GEMINI_API_KEY"] = "AIzaSyCQaUmUG74HEHD2AUCdVwOJdFp3lDrEfFs"
 
 MQTT_BROKER_IP = "192.168.0.110"
 MQTT_PORT = 1883
 MQTT_TOPIC = "mace/telemetry/tradfi_shield"
 
-ALPACA_API_KEY = "PKPQBCDBNXHU4XUXRDUB7AFIEF"
-ALPACA_SECRET_KEY = "3GZDRF2b1fxKrmvNLp9ZdQRo6rceDw4KFve9W9kYS1R9"
+MAX_PORTFOLIO_DRAWDOWN_LIMIT = 0.05
+MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08
 
-PROMPT = (
-    "You are M.A.C.E. TRADFI SHIELD, an autonomous risk-reflex agent.\n"
-    "Your sole objective is to monitor and protect capital using the Alpaca MCP tools.\n\n"
-    "EXPLICIT DIRECTIVES:\n"
-    "1. Audit Positions: Call the `mcp_alpaca_get_all_positions` tool to fetch all currently held positions in your portfolio.\n"
-    "2. Inspect Unrealized PnL: For each position returned, check the unrealized profit/loss percentage (represented as `unrealized_plpc` inside the position object).\n"
-    "3. Trigger Safe Exit: If any position has an unrealized loss of 8% or worse (i.e. `unrealized_plpc` <= -0.08, which is -8%), execute an immediate liquidating exit by calling the `mcp_alpaca_close_position` tool with the `symbol` parameter set to the asset's ticker symbol.\n"
-    "4. Summary: Return a clean, formatted JSON summary listing the assets inspected, their PnL percentages, any liquidation actions executed, or stating 'Portfolio stable' if no positions breached the stop-loss limit."
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+logger = logging.getLogger("mace.tradfi_shield")
 
-# ==============================================================================
-# 2. THE RISK REFLEX LOOP
-# ==============================================================================
-async def run_shield():
-    print("[*] Booting M.A.C.E. TRADFI SHIELD with Google Antigravity...")
-
-    # Set Alpaca credentials in environment so the MCP server can inherit them
-    os.environ["ALPACA_API_KEY"] = ALPACA_API_KEY
-    os.environ["ALPACA_SECRET_KEY"] = ALPACA_SECRET_KEY
-    os.environ["ALPACA_PAPER_TRADE"] = "true"
-
-    uvx_cmd = "/usr/local/bin/uvx" if os.path.exists("/usr/local/bin/uvx") else "uvx"
-
-    # Configure stdio MCP server for Alpaca using env wrapper to guarantee key propagation
-    mcp_servers = [
-        types.McpStdioServer(
-            name="alpaca",
-            command="/usr/bin/env",
-            args=[
-                f"ALPACA_API_KEY={ALPACA_API_KEY}",
-                f"ALPACA_SECRET_KEY={ALPACA_SECRET_KEY}",
-                "ALPACA_PAPER_TRADE=true",
-                uvx_cmd,
-                "alpaca-mcp-server",
-            ],
-        )
-    ]
-
-    config = LocalAgentConfig(
-        model="gemini-2.5-flash",  # High-frequency speed/reflex model
-        system_instructions=PROMPT,
-        mcp_servers=mcp_servers,
-    )
-
-    print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
-
-    async with Agent(config=config) as agent:
-        # Robust Retry Loop for API Demand Spikes
-        max_retries = 3
-        retry_delay = 5  # seconds
-        response = None
-
-        for attempt in range(max_retries):
-            try:
-                response = await agent.chat("Execute the TradFi risk reflex audit.")
-                break  # Success!
-            except Exception as e:
-                if ("503" in str(e) or "429" in str(e)) and attempt < max_retries - 1:
-                    print(f"[!] Gemini busy ({e}). Retrying in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    raise e  # Critical error or final attempt failed, bubble it up
-
-        if response:
-            try:
-                text_content = await response.text()
-                if text_content and text_content.strip():
-                    return text_content
-            except Exception as e:
-                print(f"[!] Error retrieving response text: {e}")
-            
-            # Safe fallback if text is empty/unreadable but tools ran successfully
-            return json.dumps({"status": "Success", "details": "Alpaca MCP stop-loss audit completed successfully."})
-        else:
-            return json.dumps({"error": "No response generated by risk agent."})
-
-def push_telemetry(result):
-    print(f"\n=== TRADFI SHIELD REPORT ===\n{result}\n============================\n")
+def push_mqtt_telemetry(payload):
     try:
-        mqttc = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
-        
-        # Support secure credentials for Home Assistant / local secure brokers
-        user = os.environ.get("MQTT_USER")
-        password = os.environ.get("MQTT_PASSWORD")
-        if user and password:
-            mqttc.username_pw_set(user, password)
-            
-        mqttc.connect(MQTT_BROKER_IP, MQTT_PORT, 10)
-        mqttc.loop_start()
-        
-        # Publish and wait for completion (timeout after 5 seconds to prevent blocking)
-        payload = {"timestamp": str(datetime.now()), "engine": "TRADFI_SHIELD", "report": result}
-        info = mqttc.publish(MQTT_TOPIC, json.dumps(payload))
-        info.wait_for_publish(timeout=5)
-        
-        mqttc.loop_stop()
-        mqttc.disconnect()
-        print("[+] Telemetry published successfully via MQTT.")
+        client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.disconnect()
     except Exception as e:
-        print(f"[!] MQTT Failed: {e}")
+        logger.error(f"[!] Telemetry update path bottlenecked: {e}")
 
-import argparse
+async def execute_deterministic_risk_loop(args):
+    logger.info("[*] Initializing M.A.C.E. Deterministic Risk Shield Loop...")
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-async def main():
-    parser = argparse.ArgumentParser(description="M.A.C.E. TradFi Shield Stop-Loss Monitor")
-    parser.add_argument("--daemon", action="store_true", help="Run continuously in background daemon mode")
-    parser.add_argument("--interval", type=int, default=900, help="Interval between audits in seconds in daemon mode (default: 900s / 15m)")
-    args = parser.parse_args()
+    if not api_key or not secret_key:
+        logger.error("[-] Alpaca API keys missing. Shield aborted.")
+        return
 
-    if args.daemon:
-        print(f"[*] Starting M.A.C.E. TradFi Shield in DAEMON mode (interval: {args.interval}s)...")
-        while True:
-            try:
-                result = await run_shield()
-                push_telemetry(result)
-            except Exception as e:
-                print(f"[!] Error in Shield daemon audit cycle: {e}")
-            print(f"[*] Sleeping for {args.interval} seconds before next risk audit...")
-            await asyncio.sleep(args.interval)
-    else:
-        result = await run_shield()
-        push_telemetry(result)
+    api = tradeapi.REST(api_key, secret_key, base_url, api_version='v2')
+
+    while True:
+        try:
+            account = await asyncio.to_thread(api.get_account)
+            positions = await asyncio.to_thread(api.list_positions)
+            execution_status = "SECURE"
+            breach_details = ""
+
+            portfolio_plpc = float(account.unrealized_plpc)
+            if portfolio_plpc <= -MAX_PORTFOLIO_DRAWDOWN_LIMIT:
+                logger.critical(f"[!!!] PORTFOLIO DRAWDOWN BREACH: {portfolio_plpc*100:.2f}%! INITIATING FULL LIQUIDATION!")
+                execution_status = "FULL_LIQUIDATION_TRIGGERED"
+                breach_details = f"Portfolio Down {portfolio_plpc*100:.2f}%"
+                for pos in positions:
+                    logger.warning(f"[*] EMERGENCY CLOSE: {pos.symbol}")
+                    await asyncio.to_thread(api.close_position, pos.symbol)
+            else:
+                for pos in positions:
+                    pos_plpc = float(pos.unrealized_plpc)
+                    if pos_plpc <= -MAX_SINGLE_POSITION_LOSS_LIMIT:
+                        logger.warning(f"[!] SINGLE ASSET BREACH: {pos.symbol} is down {pos_plpc*100:.2f}%. LIQUIDATING.")
+                        execution_status = "SINGLE_ASSET_LIQUIDATED"
+                        breach_details = f"{pos.symbol} Down {pos_plpc*100:.2f}%"
+                        await asyncio.to_thread(api.close_position, pos.symbol)
+
+            telemetry_payload = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "engine": "tradfi_shield",
+                "status": "MONITORING_ACTIVE",
+                "risk_metrics": {"portfolio_plpc": round(portfolio_plpc, 4), "open_positions": len(positions)},
+                "execution_payload": {"status": execution_status, "breach_details": breach_details}
+            }
+            push_mqtt_telemetry(telemetry_payload)
+
+        except Exception as e:
+            logger.error(f"[!] Exception inside Shield loop: {e}")
+            push_mqtt_telemetry({"engine": "tradfi_shield", "status": "SHIELD_EXCEPTION_ERROR"})
+
+        if not args.continuous:
+            break
+        await asyncio.sleep(args.interval)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="M.A.C.E. Phase 2 Deterministic TradFi Shield")
+    parser.add_argument("--continuous", action="store_true", default=True, help="Enforces permanent looping")
+    parser.add_argument("--interval", type=int, default=60, help="Frequency for evaluation checks in seconds (Default 1m/60s)")
+    args = parser.parse_args()
+    asyncio.run(execute_deterministic_risk_loop(args))
