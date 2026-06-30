@@ -1,145 +1,131 @@
+#!/usr/bin/env python3.11
+"""
+M.A.C.E. Phase 2 Crypto Shield (Deterministic Paper Math Version)
+Reads portfolio.db, fetches live CCXT prices, and enforces hard stop-losses on trades.
+"""
+
 import os
+import sys
 import json
 import asyncio
-import logging
 import argparse
+import logging
+import sqlite3
 from datetime import datetime
-from paho.mqtt import client as mqtt_client
-from google.antigravity import Agent, LocalAgentConfig, types
+import ccxt
+import paho.mqtt.client as mqtt_client
 
-# Configure logging to display SDK and execution logs
-logging.basicConfig(level=logging.INFO)
+# Base Paths
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
-# ==============================================================================
-# 1. CONFIGURATION
-# ==============================================================================
-os.environ["GEMINI_API_KEY"] = "AIzaSyCQaUmUG74HEHD2AUCdVwOJdFp3lDrEfFs"
-MQTT_BROKER_IP = "192.168.0.110"
+# MQTT Telemetry
+MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = 1883
 MQTT_TOPIC = "mace/telemetry/crypto_shield"
 
-ALPACA_API_KEY = "PKRZQUGAK5V4EDNHZ2OYFVUDPI"
-ALPACA_SECRET_KEY = "Gv5bif3RTUBKewbFBb1BfMzBYf16YWHDJyPEpwcitiie"
+# Strict Math Limits
+MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08 # 8% single asset stop-loss
 
-PROMPT = (
-    "You are M.A.C.E. CRYPTO SHIELD. Your only job is risk management. "
-    "Use the provided MCP tools to audit current open positions. "
-    "Check the unrealized profit/loss (PnL) percentage for each asset. "
-    "If an asset shows an unrealized loss of 15% or greater, execute an immediate market sell order to close the position. "
-    "Return a JSON summary of actions taken. If no actions were taken, return a JSON stating 'Portfolio stable'."
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+logger = logging.getLogger("mace.crypto_shield")
 
-# ==============================================================================
-# 2. THE RISK REFLEX LOOP
-# ==============================================================================
-async def run_shield():
-    print("[*] Booting M.A.C.E. CRYPTO SHIELD with Google Antigravity...")
+def get_db_connection(db_path=DEFAULT_DB_PATH):
+    db_uri = f"file:{db_path}?nolock=1"
+    conn = sqlite3.connect(db_uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    # Set Alpaca credentials in environment so the MCP server can inherit them
-    os.environ["ALPACA_API_KEY"] = ALPACA_API_KEY
-    os.environ["ALPACA_SECRET_KEY"] = ALPACA_SECRET_KEY
-    os.environ["ALPACA_PAPER_TRADE"] = "true"
-
-    uvx_cmd = "/usr/local/bin/uvx" if os.path.exists("/usr/local/bin/uvx") else "uvx"
-
-    # Configure stdio MCP server for Alpaca using env wrapper to guarantee key propagation
-    mcp_servers = [
-        types.McpStdioServer(
-            name="alpaca",
-            command="/usr/bin/env",
-            args=[
-                f"ALPACA_API_KEY={ALPACA_API_KEY}",
-                f"ALPACA_SECRET_KEY={ALPACA_SECRET_KEY}",
-                "ALPACA_PAPER_TRADE=true",
-                uvx_cmd,
-                "alpaca-mcp-server",
-            ],
-        )
-    ]
-
-    config = LocalAgentConfig(
-        model="gemini-2.5-flash",
-        system_instructions=PROMPT,
-        mcp_servers=mcp_servers,
-    )
-
-    print("[*] Handing control to Google Antigravity Agent...")
-
-    async with Agent(config=config) as agent:
-        # Robust Retry Loop for API Demand Spikes
-        max_retries = 3
-        retry_delay = 5  # seconds
-        response = None
-
-        for attempt in range(max_retries):
-            try:
-                response = await agent.chat("Execute the Crypto risk reflex audit.")
-                break  # Success! Break out of the loop
-            except Exception as e:
-                if ("503" in str(e) or "429" in str(e)) and attempt < max_retries - 1:
-                    print(f"[!] Gemini busy ({e}). Retrying in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    raise e  # Critical error or final attempt failed, bubble it up
-
-        if response:
-            try:
-                text_content = await response.text()
-                if text_content and text_content.strip():
-                    return text_content
-            except Exception as e:
-                print(f"[!] Error retrieving response text: {e}")
-            
-            # Safe fallback if text is empty/unreadable but tools ran successfully
-            return json.dumps({"status": "Success", "details": "Alpaca MCP stop-loss audit completed successfully."})
-        else:
-            return json.dumps({"error": "No response generated by risk agent."})
-
-def push_telemetry(result):
-    print(f"\n=== CRYPTO SHIELD REPORT ===\n{result}\n============================\n")
+def push_mqtt_telemetry(payload):
     try:
-        mqttc = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
-        
-        # Support secure credentials for Home Assistant / local secure brokers
-        user = os.environ.get("MQTT_USER")
-        password = os.environ.get("MQTT_PASSWORD")
-        if user and password:
-            mqttc.username_pw_set(user, password)
-            
-        mqttc.connect(MQTT_BROKER_IP, MQTT_PORT, 10)
-        mqttc.loop_start()
-        
-        # Publish and wait for completion (timeout after 5 seconds to prevent blocking)
-        payload = {"timestamp": str(datetime.now()), "engine": "CRYPTO_SHIELD", "report": result}
-        info = mqttc.publish(MQTT_TOPIC, json.dumps(payload))
-        info.wait_for_publish(timeout=5)
-        
-        mqttc.loop_stop()
-        mqttc.disconnect()
-        print("[+] Telemetry published successfully via MQTT.")
+        client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.disconnect()
     except Exception as e:
-        print(f"[!] MQTT Failed: {e}")
+        logger.error(f"[!] Telemetry update path bottlenecked: {e}")
 
-async def main():
-    parser = argparse.ArgumentParser(description="M.A.C.E. Crypto Shield Stop-Loss Monitor")
-    parser.add_argument("--daemon", action="store_true", help="Run continuously in background daemon mode")
-    parser.add_argument("--interval", type=int, default=900, help="Interval between audits in seconds in daemon mode (default: 900s / 15m)")
-    args = parser.parse_args()
+async def execute_deterministic_risk_loop(args):
+    logger.info("[*] Initializing M.A.C.E. Crypto Deterministic Risk Shield...")
 
-    if args.daemon:
-        print(f"[*] Starting M.A.C.E. Crypto Shield in DAEMON mode (interval: {args.interval}s)...")
-        while True:
-            try:
-                result = await run_shield()
-                push_telemetry(result)
-            except Exception as e:
-                print(f"[!] Error in Shield daemon audit cycle: {e}")
-            print(f"[*] Sleeping for {args.interval} seconds before next risk audit...")
-            await asyncio.sleep(args.interval)
-    else:
-        result = await run_shield()
-        push_telemetry(result)
+    # Initialize CCXT to fetch live prices for drawdown checks
+    exchange = ccxt.binance({'enableRateLimit': True})
+
+    while True:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # 1. Fetch all holdings (ignore USDT cash)
+            cursor.execute("SELECT token_symbol, balance, avg_entry_price FROM token_balances WHERE token_symbol != 'USDT'")
+            paper_holdings = cursor.fetchall()
+
+            execution_status = "PAPER_PORTFOLIO_SECURE"
+            breach_details = []
+
+            for holding in paper_holdings:
+                token_symbol = holding["token_symbol"]
+                paper_balance = holding["balance"]
+                entry_price = holding["avg_entry_price"]
+
+                if paper_balance <= 0 or entry_price <= 0:
+                    continue
+
+                # Reconstruct the CCXT pair (e.g., BTC -> BTC/USDT)
+                pair = f"{token_symbol}/USDT"
+
+                # 2. Fetch live market price in a thread to prevent blocking
+                try:
+                    ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
+                    current_price = ticker['last']
+                except Exception as e:
+                    logger.warning(f"[!] Could not fetch price for {pair}: {e}")
+                    continue
+
+                # 3. Calculate Drawdown
+                paper_pnl_pct = (current_price - entry_price) / entry_price
+
+                # 4. Enforce Stop-Loss Logic
+                if paper_pnl_pct <= -MAX_SINGLE_POSITION_LOSS_LIMIT:
+                    logger.warning(f"[!!!] PAPER STOP-LOSS TRIGGERED: {pair} is down {paper_pnl_pct*100:.2f}%. Simulating liquidation.")
+
+                    # Calculate USDT recovered
+                    usdt_recovered = paper_balance * current_price
+
+                    # Delete the token holding
+                    cursor.execute("DELETE FROM token_balances WHERE token_symbol = ?", (token_symbol,))
+
+                    # Add recovered cash back to USDT bucket
+                    cursor.execute("UPDATE token_balances SET balance = balance + ? WHERE token_symbol = 'USDT'", (usdt_recovered,))
+
+                    conn.commit()
+                    execution_status = "PAPER_STOP_LOSS_EXECUTED"
+                    breach_details.append(f"{pair} stopped out at {paper_pnl_pct*100:.2f}% loss.")
+
+            conn.close()
+
+            # 5. Telemetry Dispatch
+            telemetry_payload = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "engine": "crypto_shield",
+                "status": "MONITORING_ACTIVE_PAPER",
+                "execution_status": execution_status,
+                "breaches": breach_details
+            }
+            push_mqtt_telemetry(telemetry_payload)
+
+        except Exception as e:
+            logger.error(f"[!] Exception inside Shield loop: {e}")
+            push_mqtt_telemetry({"engine": "crypto_shield", "status": "SHIELD_EXCEPTION_ERROR"})
+
+        if not args.daemon:
+            break
+
+        await asyncio.sleep(args.interval)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="M.A.C.E. Crypto Deterministic Shield")
+    parser.add_argument("--daemon", action="store_true", default=True, help="Enforces permanent looping")
+    parser.add_argument("--interval", type=int, default=900, help="Frequency for evaluation checks in seconds (Default 15m/900s)")
+    args = parser.parse_args()
+    asyncio.run(execute_deterministic_risk_loop(args))

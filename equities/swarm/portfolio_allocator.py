@@ -13,55 +13,58 @@ def run_portfolio_guardrail():
 
         candidates = payload.get("candidates", [])
         available_cash = float(payload.get("available_cash", 0.0))
-        total_equity = float(payload.get("total_equity", available_cash)) # FIX: Accept total portfolio value
+        total_equity = float(payload.get("total_equity", available_cash))
         existing_positions = payload.get("existing_positions", [])
 
         approved_trades = []
-        sell_orders = [] # FIX: Add sell array
 
+        # 1. First Pass: Filter out illegal regimes, failed ML, and current holdings
         for asset in candidates:
             symbol = asset.get("symbol")
             current_state = asset.get("current_state")
             ml_confirmed = asset.get("ml_confirmed", False)
-            calculated_kelly = asset.get("calculated_kelly", 0.0)
+            calculated_kelly = float(asset.get("calculated_kelly", 0.0))
 
-            # ==========================================
-            # FIX: EXIT LOGIC (BEAR REGIME)
-            # ==========================================
-            if current_state == "Bear" and ml_confirmed and symbol in existing_positions:
-                sell_orders.append({"symbol": symbol, "reason": "HMM confirmed Bear regime shift."})
-                continue
-
-            # ==========================================
-            # ENTRY LOGIC (BULL REGIME)
-            # ==========================================
             if not ml_confirmed or current_state != "Bull" or calculated_kelly < 0.05:
                 continue
 
             if symbol in existing_positions:
                 continue
 
-            # FIX: Size against TOTAL EQUITY, not just cash, to maintain true 20% cap
-            max_allowed_usd = total_equity * 0.20
-            desired_usd = available_cash * calculated_kelly
+            approved_trades.append(asset)
 
-            # Take the lesser of Kelly desire, max exposure limit, or actual cash
-            target_size_usd = min(desired_usd, max_allowed_usd, available_cash)
+        if not approved_trades:
+            print(json.dumps({"approved_trades": [], "reason": "No candidates passed initial filtration filters."}))
+            return
 
-            if target_size_usd >= 25.0: # Alpaca minimum
-                approved_trades.append({
-                    "symbol": symbol,
-                    "calculated_kelly": calculated_kelly,
-                    "signal_strength": asset.get("signal_strength", 0.0),
-                    "target_size_usd": round(target_size_usd, 2)
-                })
+        # 2. Capital Allocation Pass: Raw Kelly Sizing based strictly on Total Equity
+        total_requested_fraction = 0.0
+        for trade in approved_trades:
+            # Enforce hard asset-level ceiling constraint (Max 20% allocation per single trade)
+            allocated_fraction = min(trade["calculated_kelly"], 0.20)
+            trade["allocated_fraction"] = allocated_fraction
+            trade["target_size_usd"] = total_equity * allocated_fraction
+            total_requested_fraction += allocated_fraction
 
-        # Output pristine operational matrix back to the orchestrator
+        # 3. Portfolio Normalization Pass (The Budget Constraint)
+        # If collective allocations exceed 90% of available cash, scale down proportionally
+        # (We use 90% to leave a small cash buffer)
+        max_deployable_fraction = (available_cash * 0.90) / total_equity if total_equity > 0 else 0
+
+        if total_requested_fraction > max_deployable_fraction:
+            normalization_factor = max_deployable_fraction / total_requested_fraction
+            for trade in approved_trades:
+                trade["allocated_fraction"] = round(trade["allocated_fraction"] * normalization_factor, 4)
+                trade["target_size_usd"] = round(trade["target_size_usd"] * normalization_factor, 2)
+                trade["normalization_applied"] = True
+        else:
+            for trade in approved_trades:
+                trade["normalization_applied"] = False
+
         print(json.dumps({
             "status": "success",
             "available_cash_pool": available_cash,
-            "approved_trades": approved_trades,
-            "sell_orders": sell_orders # PASS SELLS BACK TO ORCHESTRATOR
+            "approved_trades": approved_trades
         }))
 
     except Exception as e:

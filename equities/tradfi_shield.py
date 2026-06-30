@@ -54,7 +54,13 @@ async def execute_deterministic_risk_loop(args):
             execution_status = "SECURE"
             breach_details = ""
 
-            portfolio_plpc = float(account.unrealized_plpc)
+            # Safe fallback for different versions of Alpaca SDK
+            if hasattr(account, 'unrealized_plpc'):
+                portfolio_plpc = float(account.unrealized_plpc)
+            else:
+                # Calculate it manually: (Current Equity - Last Equity) / Last Equity
+                portfolio_plpc = (float(account.equity) - float(account.last_equity)) / float(account.last_equity)
+
             if portfolio_plpc <= -MAX_PORTFOLIO_DRAWDOWN_LIMIT:
                 logger.critical(f"[!!!] PORTFOLIO DRAWDOWN BREACH: {portfolio_plpc*100:.2f}%! INITIATING FULL LIQUIDATION!")
                 execution_status = "FULL_LIQUIDATION_TRIGGERED"

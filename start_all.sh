@@ -1,51 +1,39 @@
 #!/usr/bin/env bash
 
-# Set working directory to the directory containing this script to resolve relative paths
-cd "$(dirname "$0")" || exit 1
-
 echo "=================================================================="
 echo "   M.A.C.E. (Momentum Autonomous Cognitive Engine) Control System "
+echo "           [ Systemd Autonomous Deployment Mode ]                 "
 echo "=================================================================="
 
-# 1. Terminate any stale or duplicate instances to prevent conflicts and memory leaks
-echo "[*] Auditing and terminating existing M.A.C.E. processes..."
-pkill -f "crypto_shield.py" 2>/dev/null
-pkill -f "tradfi_shield.py" 2>/dev/null
-pkill -f "crypto/swarm/orchestrator.py" 2>/dev/null
-pkill -f "equities/swarm/orchestrator.py" 2>/dev/null
-sleep 1.5
+echo "[*] Syncing Systemd service configurations..."
+systemctl daemon-reload
 
-# Parse command-line arguments (e.g. check for --sandbox flag)
-SANDBOX_FLAG=""
-for arg in "$@"; do
-  if [ "$arg" = "--sandbox" ]; then
-    SANDBOX_FLAG="--sandbox"
-    echo "[!] Sandbox mode enabled for KuCoin Crypto Swarm."
-  fi
-done
+echo "[*] Launching Crypto Shield (15m interval)..."
+systemctl start mace-crypto-shield.service
 
-# 2. Boot background daemons
-echo "[*] Launching Crypto Shield (Stop-Loss reflex, 15m interval)..."
-nohup python3.11 -u crypto/crypto_shield.py --daemon --interval 900 >> crypto_shield.log 2>&1 &
-PID1=$!
+echo "[*] Launching TradFi Shield (1m interval)..."
+systemctl start mace-tradfi-shield.service
 
-echo "[*] Launching TradFi Shield (Stop-Loss reflex, 15m interval)..."
-nohup python3.11 -u equities/tradfi_shield.py --daemon --interval 900 >> tradfi_shield.log 2>&1 &
-PID2=$!
+echo "[*] Launching Crypto Swarm (4h interval)..."
+systemctl start mace-crypto-orchestrator.service
 
-echo "[*] Launching Crypto Swarm Orchestrator (Alphanumeric Kelly, 4h interval)..."
-nohup python3.11 -u crypto/swarm/orchestrator.py --daemon --interval 14400 $SANDBOX_FLAG >> crypto_daemon.log 2>&1 &
-PID3=$!
+echo "[*] Launching Equities Swarm (1h interval)..."
+systemctl start mace-equities-orchestrator.service
 
-echo "[*] Launching Equities Swarm Orchestrator (ML Regime Kelly, 1h interval)..."
-nohup python3.11 -u equities/swarm/orchestrator.py --daemon --interval 3600 >> equities_daemon.log 2>&1 &
-PID4=$!
+echo "[*] Launching TradFi News Guard (4h interval)..."
+systemctl start mace-tradfi-news-guard.service
 
 echo "=================================================================="
-echo "[+] All M.A.C.E. processes successfully initialized and running:"
-echo "    - 🛡️  Crypto Shield PID:          $PID1 (Log: crypto_shield.log)"
-echo "    - 🛡️  TradFi Shield PID:          $PID2 (Log: tradfi_shield.log)"
-echo "    - ⚔️  Crypto Swarm PID:           $PID3 (Log: crypto_daemon.log)"
-echo "    - ⚔️  Equities Swarm PID:         $PID4 (Log: equities_daemon.log)"
+echo "[+] M.A.C.E. Fleet Launch Sequence Complete."
 echo "=================================================================="
-echo "[*] Monitoring is live. Use: 'tail -f *.log' to view current telemetry."
+echo ""
+echo "To view live logs for a specific agent, use:"
+echo "  journalctl -u mace-crypto-shield -f"
+echo "  journalctl -u mace-tradfi-shield -f"
+echo "  journalctl -u mace-crypto-orchestrator -f"
+echo "  journalctl -u mace-equities-orchestrator -f"
+echo "  journalctl -u mace-tradfi-news-guard -f"
+echo ""
+echo "To check the health/status of all agents:"
+echo "  systemctl status 'mace-*'"
+echo "=================================================================="
