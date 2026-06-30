@@ -23,16 +23,19 @@ def compute_quantitative_signals(raw_input):
     """
     payload = json.loads(raw_input)
 
-    if payload.get("status") == "error":
-        return {"status": "error", "message": f"Scout error passed to Brain: {payload.get('message')}"}
+    # FIX: Scout emits {"symbol": ..., "error": ...} on failure, not {"status": "error", ...}
+    if "error" in payload:
+        return {"status": "error", "message": f"Scout error passed to Brain: {payload.get('error')}"}
 
-    ticker = payload.get("ticker", "UNKNOWN/USDT")
-    df_json_str = payload.get("data")
+    # FIX: Read 'symbol' and 'prices' to match scout.py output contract
+    ticker = payload.get("symbol", "UNKNOWN/USDT")
+    prices = payload.get("prices", [])
 
-    if not df_json_str:
-        return {"status": "error", "message": "Brain received empty or missing data block payload."}
+    if not prices:
+        return {"status": "error", "message": "Brain received empty or missing prices payload."}
 
-    df = pd.read_json(df_json_str)
+    # FIX: Build DataFrame directly from prices list (mirrors equities/swarm/brain.py)
+    df = pd.DataFrame({"close": prices})
 
     # INCREASED: HMMs need more data to stabilize EM convergence
     if len(df) < 200:
@@ -99,8 +102,8 @@ def compute_quantitative_signals(raw_input):
     if returns_std > 0:
         signal_strength = float(recent_returns.mean() / returns_std)
 
-    # DYNAMIC SIZING: Scale Kelly by Signal Strength Confidence
-    confidence_multiplier = np.clip(signal_strength, 0.2, 1.0)
+    # FIX: Floor confidence at 0.0 (not 0.2) so losing assets get zero allocation
+    confidence_multiplier = np.clip(signal_strength, 0.0, 1.0)
 
     # Apply Half-Kelly (divide by 2) to protect the fund, then scale by confidence
     dynamic_kelly = (theoretical_kelly / 2.0) * confidence_multiplier
