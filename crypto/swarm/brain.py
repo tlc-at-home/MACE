@@ -11,6 +11,8 @@ Safety: Internalizes exceptions to output structured JSON error messages down-pi
 """
 
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 import json
 import numpy as np
 import pandas as pd

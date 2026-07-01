@@ -144,7 +144,7 @@ async def execute_swarm_sweep(args):
             "top_regime_signal": {"ticker": symbol, "regime": regime, "calculated_kelly": kelly_fraction, "signal_strength": signal_strength},
             "execution_payload": {"status": execution_status, "allocated_dollars": allocated_dollars}
         }
-        asyncio.to_thread(push_mqtt_telemetry, telemetry_payload)
+        await asyncio.to_thread(push_mqtt_telemetry, telemetry_payload)
 
 async def main_async():
     parser = argparse.ArgumentParser(description="M.A.C.E. Phase 2 Multi-Agent Swarm Orchestrator Engine")
