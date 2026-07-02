@@ -10,7 +10,7 @@ import json
 import asyncio
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import paho.mqtt.client as mqtt_client
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -27,13 +27,29 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger("mace.orchestrator")
 
 def load_universe():
+    """Reads and parses the broad-market token list from the system config directory."""
     if not os.path.exists(UNIVERSE_PATH):
         logger.warning(f"Universe profile missing at {UNIVERSE_PATH}. Deploying default core triage targets.")
         return ["BTC/USDT", "SOL/USDT", "ETH/USDT", "NEAR/USDT", "AVAX/USDT"]
     try:
         with open(UNIVERSE_PATH, "r") as f:
-            universe = json.load(f)
-            return universe if isinstance(universe, list) else [universe]
+            raw_universe = json.load(f)
+
+        # Ensure root is a list
+        if not isinstance(raw_universe, list):
+            raw_universe = [raw_universe]
+
+        formatted_universe = []
+        for asset in raw_universe:
+            # Strictly enforce new object schema
+            if isinstance(asset, dict) and "ticker" in asset:
+                ticker = asset["ticker"]
+                # CCXT requires a pair format (e.g., WBTC -> WBTC/USDT)
+                if "/" not in ticker:
+                    ticker = f"{ticker}/USDT"
+                formatted_universe.append(ticker)
+
+        return formatted_universe
     except Exception as e:
         logger.error(f"[-] Critical exception encountered parsing asset registry json disk mapping: {e}")
         return []
@@ -46,6 +62,28 @@ def push_mqtt_telemetry(payload):
         client.disconnect()
     except Exception as e:
         logger.error(f"[!] Asynchronous telemetry network link bottleneck: {e}")
+
+def get_seconds_until_next_4h_offset():
+    """
+    Calculates exact seconds to sleep until the next 4-hour UTC boundary + 5 minutes (e.g., 00:05, 04:05, 08:05).
+    """
+    now = datetime.utcnow()
+
+    # Calculate which 4-hour block we are in (0, 4, 8, 12, 16, 20)
+    current_block = (now.hour // 4) * 4
+    next_block = current_block + 4
+
+    # Target time is next_block:05:00 UTC
+    target_time = now.replace(hour=next_block if next_block < 24 else 0, minute=5, second=0, microsecond=0)
+
+    # If the target time is in the past, it means we missed the 05-minute window for the current block
+    # Wait until the NEXT 4-hour block.
+    if target_time <= now:
+        target_time += timedelta(days=1)
+
+    # Calculate the delta
+    delta = target_time - now
+    return int(delta.total_seconds())
 
 async def process_single_asset_pipeline(symbol, semaphore):
     async with semaphore:
@@ -107,11 +145,11 @@ async def execute_swarm_sweep(args):
                 if token_symbol in chain_data.get("tokens", {}):
                     held_token = chain_data["tokens"][token_symbol]
                     break
-            if held_token and held_token["balance"] > 0:
+            if held_token and held_token["quantity"] > 0:
                 current_price = float(signal.get("current_price", held_token["avg_entry_price"]))
-                ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["balance"], execution_price=current_price)
+                ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
                 if ledger_receipt.get("success"):
-                    logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['balance']:.4f} {symbol} due to Bear regime.")
+                    logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
                     execution_status = "SOLD_BEAR_REGIME"
                 else:
                     execution_status = "SELL_FAILED"
@@ -150,15 +188,21 @@ async def main_async():
     parser = argparse.ArgumentParser(description="M.A.C.E. Phase 2 Multi-Agent Swarm Orchestrator Engine")
     parser.add_argument("--limit", type=int, default=0, help="Enforce limit constraints to test smaller token arrays")
     parser.add_argument("--daemon", action="store_true", help="Instantiates script as an uninterrupted polling daemon service")
-    parser.add_argument("--interval", type=int, default=14400, help="Interval window duration parameters in seconds (Default 4h/14400s)")
+    parser.add_argument("--interval", type=int, default=14400, help="Interval window duration parameters in seconds (Default 4h/14400s) - IGNORED IN DAEMON MODE IN FAVOR OF UTC SYNC")
     args = parser.parse_args()
 
     if args.daemon:
-        logger.info(f"[*] Booting M.A.C.E. Continuous Background Worker. Loop interval rate configuration: {args.interval}s")
+        logger.info("[*] Booting M.A.C.E. Continuous Background Worker. Synchronized to 4-Hour UTC Boundaries (HH:05:00).")
         while True:
-            await execute_swarm_sweep(args)
-            logger.info(f"[*] Task sequence finalized. Routing background task sleep thread for {args.interval}s...")
-            await asyncio.sleep(args.interval)
+            try:
+                await execute_swarm_sweep(args)
+            except Exception as e:
+                logger.error(f"[!] Error during daemon run sweep: {e}")
+
+            logger.info("[*] Task sequence finalized. Calculating sleep duration until next 4H UTC offset (HH:05:00)...")
+            sleep_duration = get_seconds_until_next_4h_offset()
+            logger.info(f"[*] Sleeping for {sleep_duration}s...")
+            await asyncio.sleep(sleep_duration)
     else:
         await execute_swarm_sweep(args)
         logger.info("[+] Single swarm routing pass executed cleanly. Core shut down.")

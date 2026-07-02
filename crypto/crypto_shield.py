@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.11
 """
-M.A.C.E. Phase 2 Crypto Shield (Deterministic Paper Math Version)
-Reads portfolio.db, fetches live CCXT prices, and enforces hard stop-losses on trades.
+M.A.C.E. Phase 2 Crypto Shield (Deterministic Math Version)
+Reads portfolio DB, fetches live CCXT prices, and enforces hard stop-losses on paper trades.
 """
 
 import os
@@ -25,13 +25,15 @@ MQTT_PORT = 1883
 MQTT_TOPIC = "mace/telemetry/crypto_shield"
 
 # Strict Math Limits
-MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08 # 8% single asset stop-loss
+MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08 # 8% single asset paper stop-loss
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("mace.crypto_shield")
 
 def get_db_connection(db_path=DEFAULT_DB_PATH):
-    db_uri = f"file:{db_path}?nolock=1"
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    abs_db_path = os.path.abspath(db_path)
+    db_uri = f"file:{abs_db_path}?nolock=1"
     conn = sqlite3.connect(db_uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -48,31 +50,34 @@ def push_mqtt_telemetry(payload):
 async def execute_deterministic_risk_loop(args):
     logger.info("[*] Initializing M.A.C.E. Crypto Deterministic Risk Shield...")
 
-    # Initialize CCXT to fetch live prices for drawdown checks
-    exchange = ccxt.binance({'enableRateLimit': True})
+    # Initialize CCXT to fetch live prices for paper drawdown checks
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
 
     while True:
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Fetch all holdings (ignore USDT cash)
-            cursor.execute("SELECT token_symbol, balance, avg_entry_price FROM token_balances WHERE token_symbol != 'USDT'")
+            # 1. Fetch all paper holdings (ignore USDT cash)
+            cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE token != 'USDT'")
             paper_holdings = cursor.fetchall()
 
             execution_status = "PAPER_PORTFOLIO_SECURE"
             breach_details = []
 
             for holding in paper_holdings:
-                token_symbol = holding["token_symbol"]
-                paper_balance = holding["balance"]
+                token = holding["token"]
+                paper_quantity = holding["quantity"]
                 entry_price = holding["avg_entry_price"]
 
-                if paper_balance <= 0 or entry_price <= 0:
+                if paper_quantity <= 0 or entry_price <= 0:
                     continue
 
                 # Reconstruct the CCXT pair (e.g., BTC -> BTC/USDT)
-                pair = f"{token_symbol}/USDT"
+                pair = f"{token}/USDT"
 
                 # 2. Fetch live market price in a thread to prevent blocking
                 try:
@@ -82,7 +87,7 @@ async def execute_deterministic_risk_loop(args):
                     logger.warning(f"[!] Could not fetch price for {pair}: {e}")
                     continue
 
-                # 3. Calculate Drawdown
+                # 3. Calculate Paper Drawdown
                 paper_pnl_pct = (current_price - entry_price) / entry_price
 
                 # 4. Enforce Stop-Loss Logic
@@ -90,13 +95,13 @@ async def execute_deterministic_risk_loop(args):
                     logger.warning(f"[!!!] PAPER STOP-LOSS TRIGGERED: {pair} is down {paper_pnl_pct*100:.2f}%. Simulating liquidation.")
 
                     # Calculate USDT recovered
-                    usdt_recovered = paper_balance * current_price
+                    usdt_recovered = paper_quantity * current_price
 
                     # Delete the token holding
-                    cursor.execute("DELETE FROM token_balances WHERE token_symbol = ?", (token_symbol,))
+                    cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
 
                     # Add recovered cash back to USDT bucket
-                    cursor.execute("UPDATE token_balances SET balance = balance + ? WHERE token_symbol = 'USDT'", (usdt_recovered,))
+                    cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
 
                     conn.commit()
                     execution_status = "PAPER_STOP_LOSS_EXECUTED"
