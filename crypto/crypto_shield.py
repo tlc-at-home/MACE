@@ -1,7 +1,8 @@
 #!/usr/bin/env python3.11
 """
-M.A.C.E. Phase 2 Crypto Shield (Deterministic Math Version)
-Reads portfolio DB, fetches live CCXT prices, and enforces hard stop-losses on paper trades.
+M.A.C.E. Phase 2 Crypto Shield (True Trailing Stop-Loss - Explicit Formatting)
+Tracks High-Water Marks natively in portfolio.db to protect profits independently
+of Orchestrator rebalancing loops and capital constraints.
 """
 
 import os
@@ -13,19 +14,13 @@ import logging
 import sqlite3
 from datetime import datetime
 import ccxt
-import paho.mqtt.client as mqtt_client
 
 # Base Paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
-# MQTT Telemetry
-MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
-MQTT_PORT = 1883
-MQTT_TOPIC = "mace/telemetry/crypto_shield"
-
 # Strict Math Limits
-MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08 # 8% single asset paper stop-loss
+MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08  # 8% trailing stop-loss from peak
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("mace.crypto_shield")
@@ -34,103 +29,117 @@ def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
     db_uri = f"file:{abs_db_path}?nolock=1"
-    conn = sqlite3.connect(db_uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(db_uri, uri=True)
 
-def push_mqtt_telemetry(payload):
-    try:
-        client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
-        client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, json.dumps(payload))
-        client.disconnect()
-    except Exception as e:
-        logger.error(f"[!] Telemetry update path bottlenecked: {e}")
+class CryptoShield:
+    def __init__(self):
+        self.primary_exchange = ccxt.kucoin({'enableRateLimit': True})
+        self.fallback_exchange = ccxt.binance({'enableRateLimit': True})
+        logger.info("[*] Autonomous Trailing Defensive Shield Connected. Source: KuCoin")
 
-async def execute_deterministic_risk_loop(args):
-    logger.info("[*] Initializing M.A.C.E. Crypto Deterministic Risk Shield...")
+    async def fetch_live_price(self, pair):
+        target_pair = pair.replace("_", "/")
+        try:
+            ticker = await asyncio.to_thread(self.primary_exchange.fetch_ticker, target_pair)
+            return float(ticker['last'])
+        except (ccxt.BadSymbol, ccxt.MarketNotReady, ccxt.ExchangeError):
+            try:
+                logger.warning(f"[-] Synced feed failed or symbol {target_pair} unavailable on KuCoin. Failover routing to Binance...")
+                ticker = await asyncio.to_thread(self.fallback_exchange.fetch_ticker, target_pair)
+                return float(ticker['last'])
+            except Exception as backup_error:
+                logger.error(f"[!] Critical Error: Ticker lookup failed for {target_pair} across both pools: {backup_error}")
+                return None
+        except Exception as e:
+            logger.error(f"[!] Unexpected error fetching price for {target_pair}: {e}")
+            return None
 
-    # Initialize CCXT to fetch live prices for paper drawdown checks
-    exchange = ccxt.binance({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
-    })
+    async def run_shield_cycle(self):
+        logger.info("[*] Commencing deterministic 15-minute risk trailing sweep...")
+        breach_details = []
 
-    while True:
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Fetch all paper holdings (ignore USDT cash)
-            cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE token != 'USDT'")
-            paper_holdings = cursor.fetchall()
+            # Extract active assets with entry price and high water mark columns
+            cursor.execute("SELECT token, quantity, avg_entry_price, high_water_mark FROM portfolio WHERE quantity > 0 AND token != 'USDT'")
+            active_positions = cursor.fetchall()
 
-            execution_status = "PAPER_PORTFOLIO_SECURE"
-            breach_details = []
+            if not active_positions:
+                logger.info("[*] Sweep complete: No active token holdings found in the matrix database ledger.")
+                conn.close()
+                return
 
-            for holding in paper_holdings:
-                token = holding["token"]
-                paper_quantity = holding["quantity"]
-                entry_price = holding["avg_entry_price"]
-
-                if paper_quantity <= 0 or entry_price <= 0:
-                    continue
-
-                # Reconstruct the CCXT pair (e.g., BTC -> BTC/USDT)
+            for token, qty, cost_basis, hwm in active_positions:
                 pair = f"{token}/USDT"
 
-                # 2. Fetch live market price in a thread to prevent blocking
-                try:
-                    ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
-                    current_price = ticker['last']
-                except Exception as e:
-                    logger.warning(f"[!] Could not fetch price for {pair}: {e}")
+                if not cost_basis or cost_basis <= 0:
                     continue
 
-                # 3. Calculate Paper Drawdown
-                paper_pnl_pct = (current_price - entry_price) / entry_price
+                live_price = await self.fetch_live_price(pair)
+                if not live_price:
+                    continue
 
-                # 4. Enforce Stop-Loss Logic
-                if paper_pnl_pct <= -MAX_SINGLE_POSITION_LOSS_LIMIT:
-                    logger.warning(f"[!!!] PAPER STOP-LOSS TRIGGERED: {pair} is down {paper_pnl_pct*100:.2f}%. Simulating liquidation.")
-
-                    # Calculate USDT recovered
-                    usdt_recovered = paper_quantity * current_price
-
-                    # Delete the token holding
-                    cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
-
-                    # Add recovered cash back to USDT bucket
-                    cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
-
+                # Architectural Catch: If high water mark is uninitialized, seed it with the current price
+                if not hwm or hwm <= 0:
+                    hwm = max(cost_basis, live_price)
+                    cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
                     conn.commit()
-                    execution_status = "PAPER_STOP_LOSS_EXECUTED"
-                    breach_details.append(f"{pair} stopped out at {paper_pnl_pct*100:.2f}% loss.")
+
+                # Peak Ratchet: If the price breaks a new high, lock it into database state immediately
+                if live_price > hwm:
+                    if hwm < 0.01 or live_price < 0.01:
+                        logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.8f} -> ${live_price:.8f}")
+                    else:
+                        logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.4f} -> ${live_price:.4f}")
+                    hwm = live_price
+                    cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
+                    conn.commit()
+
+                # Compute drawdown metrics relative directly to the Peak High Water Mark
+                trailing_drawdown_pct = (live_price - hwm) / hwm
+                floor_price = hwm * (1 - MAX_SINGLE_POSITION_LOSS_LIMIT)
+
+                # Dynamic conditional formatting blocks based on asset scale properties
+                if live_price < 0.01:
+                    logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.8f} | Live: ${live_price:.8f} | Floor Target: ${floor_price:.8f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
+                else:
+                    logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.4f} | Live: ${live_price:.4f} | Floor Target: ${floor_price:.4f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
+
+                # Hard Check: Validate if current asset values breach the trailing peak floor
+                if trailing_drawdown_pct <= -MAX_SINGLE_POSITION_LOSS_LIMIT:
+                    logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
+
+                    usdt_recovered = qty * live_price
+                    if live_price < 0.01:
+                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT")
+                    else:
+                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
+
+                    # Execute atomic database balance swap and reset the tracking anchors
+                    cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0, high_water_mark = 0 WHERE token = ?", (token,))
+                    cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
+                    conn.commit()
+                    breach_details.append(f"{pair} stopped out at trailing floor.")
 
             conn.close()
 
-            # 5. Telemetry Dispatch
-            telemetry_payload = {
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "engine": "crypto_shield",
-                "status": "MONITORING_ACTIVE_PAPER",
-                "execution_status": execution_status,
-                "breaches": breach_details
-            }
-            push_mqtt_telemetry(telemetry_payload)
-
         except Exception as e:
-            logger.error(f"[!] Exception inside Shield loop: {e}")
-            push_mqtt_telemetry({"engine": "crypto_shield", "status": "SHIELD_EXCEPTION_ERROR"})
+            logger.error(f"[!] Exception caught inside main Shield trailing execution block: {e}")
 
+async def main():
+    shield = CryptoShield()
+    while True:
+        await shield.run_shield_cycle()
         if not args.daemon:
             break
-
         await asyncio.sleep(args.interval)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="M.A.C.E. Crypto Deterministic Shield")
+    parser = argparse.ArgumentParser(description="M.A.C.E. Crypto Trailing Shield")
     parser.add_argument("--daemon", action="store_true", default=True, help="Enforces permanent looping")
-    parser.add_argument("--interval", type=int, default=900, help="Frequency for evaluation checks in seconds (Default 15m/900s)")
+    parser.add_argument("--interval", type=int, default=900, help="Frequency for evaluation checks in seconds")
     args = parser.parse_args()
-    asyncio.run(execute_deterministic_risk_loop(args))
+
+    asyncio.run(main())
