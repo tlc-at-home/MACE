@@ -13,10 +13,25 @@ import logging
 import sqlite3
 from datetime import datetime
 import ccxt
+import paho.mqtt.client as mqtt_client
 
 # Base Paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+
+# MQTT Config
+MQTT_BROKER_IP = "192.168.0.110"
+MQTT_PORT = 1883
+MQTT_TOPIC = "mace/telemetry/crypto_shield"
+
+def push_mqtt_telemetry(payload):
+    try:
+        client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.disconnect()
+    except Exception as e:
+        logger.error(f"[!] Telemetry update path bottlenecked: {e}")
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("mace.crypto_shield")
@@ -54,6 +69,8 @@ class CryptoShield:
     async def run_shield_cycle(self):
         logger.info("[*] Commencing deterministic 15-minute risk trailing sweep...")
         breach_details = []
+        positions_telemetry = []
+        total_holdings_value = 0.0
 
         try:
             conn = get_db_connection()
@@ -63,8 +80,25 @@ class CryptoShield:
             cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE quantity > 0 AND token != 'USDT'")
             active_positions = cursor.fetchall()
 
+            # We also query the cash balance (USDT)
+            cursor.execute("SELECT quantity FROM portfolio WHERE token = 'USDT'")
+            cash_row = cursor.fetchone()
+            usdt_balance = float(cash_row["quantity"]) if cash_row else 0.0
+            current_usdt_balance = usdt_balance
+
             if not active_positions:
                 logger.info("[*] Sweep complete: No active token holdings found in the matrix database ledger.")
+                telemetry_payload = {
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "engine": "crypto_shield",
+                    "status": "MONITORING_ACTIVE",
+                    "usdt_balance": round(usdt_balance, 2),
+                    "total_holdings_value": 0.0,
+                    "total_portfolio_value": round(usdt_balance, 2),
+                    "positions": [],
+                    "breaches": []
+                }
+                push_mqtt_telemetry(telemetry_payload)
                 conn.close()
                 return
 
@@ -140,8 +174,33 @@ class CryptoShield:
                     cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
                     cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
                     conn.commit()
+                    current_usdt_balance += usdt_recovered
                     breach_details.append(f"{pair} stopped out at trailing floor.")
+                else:
+                    total_holdings_value += qty * live_price
+                    positions_telemetry.append({
+                        "token": token,
+                        "qty": qty,
+                        "avg_cost": cost_basis,
+                        "live_price": live_price,
+                        "hwm": hwm,
+                        "loss_limit": loss_limit,
+                        "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
+                        "value_usdt": round(qty * live_price, 2)
+                    })
 
+            total_portfolio_value = current_usdt_balance + total_holdings_value
+            telemetry_payload = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "engine": "crypto_shield",
+                "status": "MONITORING_ACTIVE",
+                "usdt_balance": round(current_usdt_balance, 2),
+                "total_holdings_value": round(total_holdings_value, 2),
+                "total_portfolio_value": round(total_portfolio_value, 2),
+                "positions": positions_telemetry,
+                "breaches": breach_details
+            }
+            push_mqtt_telemetry(telemetry_payload)
             conn.close()
 
         except Exception as e:

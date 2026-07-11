@@ -21,6 +21,15 @@ MQTT_BROKER_IP = "192.168.0.110"
 MQTT_PORT = 1883
 MQTT_TOPIC = "mace/telemetry/tradfi_shield"
 
+def push_mqtt_telemetry(payload):
+    try:
+        client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.disconnect()
+    except Exception as e:
+        logger.error(f"[!] Telemetry update path bottlenecked: {e}")
+
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("mace.tradfi_shield")
 
@@ -53,7 +62,14 @@ class TradFiShield:
 
     async def run_shield_sweep(self):
         logger.info("[*] Commencing stateless calculated risk evaluation sweep...")
+        breach_details = []
+        positions_telemetry = []
+
         try:
+            account = await asyncio.to_thread(self.api.get_account)
+            total_portfolio_value = float(account.equity)
+            cash_balance = float(account.cash)
+
             positions = await asyncio.to_thread(self.api.list_positions)
 
             for pos in positions:
@@ -82,6 +98,31 @@ class TradFiShield:
                     with sqlite3.connect(DEFAULT_DB_PATH) as conn:
                         conn.cursor().execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
                         conn.commit()
+
+                    breach_details.append(f"{symbol} stopped out at {trailing_drawdown_pct*100:.2f}% loss from HWM.")
+                else:
+                    positions_telemetry.append({
+                        "symbol": symbol,
+                        "qty": qty,
+                        "avg_cost": avg_entry,
+                        "live_price": live_price,
+                        "hwm": hwm,
+                        "loss_limit": loss_limit,
+                        "floor_price": round(floor_price, 2),
+                        "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
+                        "market_value": round(qty * live_price, 2)
+                    })
+
+            telemetry_payload = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "engine": "tradfi_shield",
+                "status": "MONITORING_ACTIVE",
+                "cash_balance": round(cash_balance, 2),
+                "total_portfolio_value": round(total_portfolio_value, 2),
+                "positions": positions_telemetry,
+                "breaches": breach_details
+            }
+            push_mqtt_telemetry(telemetry_payload)
 
         except Exception as e:
             logger.error(f"[!] Exception within protection loop context: {e}")
