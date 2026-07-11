@@ -18,7 +18,7 @@ def run_brain():
             return
 
         symbol = data.get("symbol")
-        prices = data.get("prices", [])
+        prices = data.get("prices", data.get("close", []))
 
         if len(prices) < 100:
             print(json.dumps({"symbol": symbol, "error": f"Insufficient prices data: {len(prices)}"}))

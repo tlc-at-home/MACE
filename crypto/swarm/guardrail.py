@@ -22,8 +22,7 @@ MIN_TRADE_SIZE_USD = 10.0
 def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
-    db_uri = f"file:{abs_db_path}?nolock=1"
-    conn = sqlite3.connect(db_uri, uri=True)
+    conn = sqlite3.connect(abs_db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -52,12 +51,21 @@ def init_db(db_path=DEFAULT_DB_PATH):
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_hwm (
+                symbol TEXT PRIMARY KEY,
+                high_water_mark REAL NOT NULL,
+                loss_limit REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
         cursor.execute("SELECT COUNT(*) FROM wallets")
         if cursor.fetchone()[0] == 0:
             logger.info("[*] Seeding fresh virtual multi-chain network infrastructure...")
-            cursor.execute("INSERT INTO wallets VALUES ('SOLANA', 'MaceSolanaWallet111111111111111111111', 10.0, 'SOL')")
-            cursor.execute("INSERT INTO wallets VALUES ('ARBITRUM', '0xMaceArbitrumExecutionSandboxWalletAddress', 0.5, 'ETH')")
-            cursor.execute("INSERT INTO portfolio VALUES ('ARBITRUM', 'USDT', 10000.00, 1.00)")
+            cursor.execute("INSERT INTO wallets (blockchain, public_key, gas_balance, gas_token) VALUES ('SOLANA', 'MaceSolanaWallet111111111111111111111', 10.0, 'SOL')")
+            cursor.execute("INSERT INTO wallets (blockchain, public_key, gas_balance, gas_token) VALUES ('ARBITRUM', '0xMaceArbitrumExecutionSandboxWalletAddress', 0.5, 'ETH')")
+            cursor.execute("INSERT INTO portfolio (blockchain, token, quantity, avg_entry_price) VALUES ('ARBITRUM', 'USDT', 10000.00, 1.00)")
             conn.commit()
             logger.info("[+] Seeding sequence completed successfully.")
 
@@ -143,7 +151,7 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
                 new_avg_price = new_avg_price
             else:
                 cursor.execute(
-                    "INSERT INTO portfolio VALUES (?, ?, ?, ?)",
+                    "INSERT INTO portfolio (blockchain, token, quantity, avg_entry_price) VALUES (?, ?, ?, ?)",
                     (blockchain, token, quantity, execution_price)
                 )
                 new_balance = quantity
@@ -283,54 +291,6 @@ def run_piped_risk_gate(brain_output_str):
     finally:
         conn.close()
 
-    try:
-        signal_data = json.loads(brain_output_str)
-    except Exception:
-        return {"status": "error", "message": "Guardrail failed to parse standard input token payload."}
-
-    if signal_data.get("status") != "success":
-        return {"status": "ignored", "reason": "Brain signal packet reported upstream error configuration."}
-
-    ticker = signal_data.get("ticker", "UNKNOWN/USDT")
-    regime = signal_data.get("regime", "Unknown")
-    kelly_f = float(signal_data.get("kelly_fraction", 0.0))
-    current_price = float(signal_data.get("current_price", 0.0))
-
-    if current_price <= 0:
-        return {"status": "error", "message": "Guardrail received invalid current price from brain."}
-
-    if regime != "Bull" or kelly_f <= 0.0:
-        return {"status": "gate_closed", "ticker": ticker, "regime": regime, "allocated_dollars": 0.0, "reason": "Market regime does not conform to risk-on constraints."}
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT balance FROM token_balances WHERE blockchain = 'ARBITRUM' AND token_symbol = 'USDT'")
-        cash_row = cursor.fetchone()
-        available_usdt = float(cash_row["balance"]) if cash_row else 0.0
-
-        cursor.execute("SELECT token_symbol, balance, avg_entry_price FROM token_balances WHERE token_symbol != 'USDT'")
-        existing_holdings = cursor.fetchall()
-
-        total_portfolio_value = available_usdt
-        for holding in existing_holdings:
-            proxy_price = holding["avg_entry_price"]
-            if holding["token_symbol"] == ticker.split("/")[0]:
-                proxy_price = current_price
-            total_portfolio_value += (holding["balance"] * proxy_price)
-
-        max_allowed_dollars = total_portfolio_value * MAX_SINGLE_ASSET_EXPOSURE
-        desired_allocation_usd = available_usdt * kelly_f
-        effective_cap = min(desired_allocation_usd, max_allowed_dollars, (available_usdt - MIN_TRADE_SIZE_USD))
-        target_allocation_usd = max(0.0, effective_cap)
-
-        if target_allocation_usd < MIN_TRADE_SIZE_USD:
-            return {"status": "gate_closed", "ticker": ticker, "allocated_dollars": 0.0, "total_portfolio_value": round(total_portfolio_value, 2), "reason": "Calculated position scale maps below absolute trade sizing floor."}
-
-        return {"status": "approved", "ticker": ticker, "regime": regime, "kelly_fraction": kelly_f, "total_portfolio_value": round(total_portfolio_value, 2), "max_exposure_limit": round(max_allowed_dollars, 2), "allocated_dollars": round(target_allocation_usd, 2)}
-    finally:
-        conn.close()
-
 if __name__ == "__main__":
     init_db()
     if not sys.stdin.isatty():
@@ -345,5 +305,5 @@ if __name__ == "__main__":
         print(f"\nChain: {chain}\n  Wallet Public Key : {data['public_key']}\n  Native Gas Balance: {data['gas_balance']:.4f} {data['gas_token']}\n  Token Assets:")
         if not data["tokens"]: print("    (No positive balances held)")
         else:
-            for tok, tdata in data["tokens"].items(): print(f"    - {tok}: {tdata['balance']:.2f} (Avg Cost: ${tdata['avg_entry_price']:.2f})")
+            for tok, tdata in data["tokens"].items(): print(f"    - {tok}: {tdata['quantity']:.2f} (Avg Cost: ${tdata['avg_entry_price']:.2f})")
     print("="*50 + "\n")

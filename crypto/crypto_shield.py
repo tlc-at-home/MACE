@@ -1,8 +1,7 @@
 #!/usr/bin/env python3.11
 """
-M.A.C.E. Phase 2 Crypto Shield (True Trailing Stop-Loss - Explicit Formatting)
-Tracks High-Water Marks natively in portfolio.db to protect profits independently
-of Orchestrator rebalancing loops and capital constraints.
+M.A.C.E. Phase 2 Crypto Shield (Dynamic Volatility-Based Trailing Stop-Loss)
+Enforces trailing stop-losses calculated dynamically from asset volatility.
 """
 
 import os
@@ -19,17 +18,15 @@ import ccxt
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
-# Strict Math Limits
-MAX_SINGLE_POSITION_LOSS_LIMIT = 0.08  # 8% trailing stop-loss from peak
-
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("mace.crypto_shield")
 
 def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
-    db_uri = f"file:{abs_db_path}?nolock=1"
-    return sqlite3.connect(db_uri, uri=True)
+    conn = sqlite3.connect(abs_db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 class CryptoShield:
     def __init__(self):
@@ -62,8 +59,8 @@ class CryptoShield:
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # Extract active assets with entry price and high water mark columns
-            cursor.execute("SELECT token, quantity, avg_entry_price, high_water_mark FROM portfolio WHERE quantity > 0 AND token != 'USDT'")
+            # Extract active assets with entry price columns
+            cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE quantity > 0 AND token != 'USDT'")
             active_positions = cursor.fetchall()
 
             if not active_positions:
@@ -71,20 +68,33 @@ class CryptoShield:
                 conn.close()
                 return
 
-            for token, qty, cost_basis, hwm in active_positions:
+            for row in active_positions:
+                token = row["token"]
+                qty = float(row["quantity"])
+                cost_basis = float(row["avg_entry_price"])
                 pair = f"{token}/USDT"
 
                 if not cost_basis or cost_basis <= 0:
                     continue
 
                 live_price = await self.fetch_live_price(pair)
-                if not live_price:
+                if live_price is None:
                     continue
 
-                # Architectural Catch: If high water mark is uninitialized, seed it with the current price
-                if not hwm or hwm <= 0:
+                # Query trailing stop-loss metrics from crypto_hwm
+                cursor.execute("SELECT high_water_mark, loss_limit FROM crypto_hwm WHERE symbol = ?", (pair,))
+                hwm_row = cursor.fetchone()
+                if hwm_row:
+                    hwm = float(hwm_row["high_water_mark"])
+                    loss_limit = float(hwm_row["loss_limit"])
+                else:
                     hwm = max(cost_basis, live_price)
-                    cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
+                    loss_limit = 0.08
+                    now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO crypto_hwm (symbol, high_water_mark, loss_limit, updated_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (pair, hwm, loss_limit, now_str))
                     conn.commit()
 
                 # Peak Ratchet: If the price breaks a new high, lock it into database state immediately
@@ -94,12 +104,17 @@ class CryptoShield:
                     else:
                         logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.4f} -> ${live_price:.4f}")
                     hwm = live_price
-                    cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
+                    cursor.execute("UPDATE crypto_hwm SET high_water_mark = ? WHERE symbol = ?", (hwm, pair))
+                    # Also update the portfolio table column if present
+                    try:
+                        cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
+                    except sqlite3.OperationalError:
+                        pass
                     conn.commit()
 
                 # Compute drawdown metrics relative directly to the Peak High Water Mark
                 trailing_drawdown_pct = (live_price - hwm) / hwm
-                floor_price = hwm * (1 - MAX_SINGLE_POSITION_LOSS_LIMIT)
+                floor_price = hwm * (1 - loss_limit)
 
                 # Dynamic conditional formatting blocks based on asset scale properties
                 if live_price < 0.01:
@@ -108,7 +123,7 @@ class CryptoShield:
                     logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.4f} | Live: ${live_price:.4f} | Floor Target: ${floor_price:.4f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
 
                 # Hard Check: Validate if current asset values breach the trailing peak floor
-                if trailing_drawdown_pct <= -MAX_SINGLE_POSITION_LOSS_LIMIT:
+                if trailing_drawdown_pct <= -loss_limit:
                     logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
 
                     usdt_recovered = qty * live_price
@@ -118,7 +133,11 @@ class CryptoShield:
                         logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
 
                     # Execute atomic database balance swap and reset the tracking anchors
-                    cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0, high_water_mark = 0 WHERE token = ?", (token,))
+                    try:
+                        cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0, high_water_mark = 0 WHERE token = ?", (token,))
+                    except sqlite3.OperationalError:
+                        cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0 WHERE token = ?", (token,))
+                    cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
                     cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
                     conn.commit()
                     breach_details.append(f"{pair} stopped out at trailing floor.")
