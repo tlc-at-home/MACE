@@ -16,10 +16,12 @@ from datetime import datetime, timedelta, timezone
 DB_PATH = "/home/fedora/MACE/config/portfolio.db"
 
 def get_alpaca_context():
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret_key = os.environ.get("ALPACA_SECRET_KEY")
+    # Clean environmental values of literal surrounding quotes if present
+    api_key = os.environ.get("ALPACA_API_KEY", "").strip("'\"")
+    secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip("'\"")
     is_paper = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() == "true"
     base_url = "https://paper-api.alpaca.markets" if is_paper else "https://api.alpaca.markets"
+
     if not api_key or not secret_key:
         return None
     return {"headers": {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}, "base_url": base_url}
@@ -37,27 +39,16 @@ def get_max_fill_time(symbol, ctx):
                 raw_time = buy_orders[0]["filled_at"].split(".")[0].replace("Z", "")
                 return datetime.strptime(raw_time, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception as e:
-        sys.stderr.write(f"[!] Order retrieval anomaly for {symbol}: {e}\n")
+        sys.stderr.write(f"[!] Order history search drop for {symbol}: {e}\n")
     return None
 
 def calculate_volatility_stop(bars):
-    """
-    Computes standard deviation of log returns across historical bars
-    to create an explicit, personalized asset protection buffer.
-    """
     try:
         closes = [float(bar["c"]) for bar in bars]
         if len(closes) < 10:
-            return 0.05  # Standard 5% fallback if data depth fails
-
+            return 0.05
         log_returns = np.diff(np.log(closes))
-        # Measure standard deviation (market noise proxy)
-        sample_std = np.std(log_returns)
-
-        # Multiply standard deviation to sit outside standard intra-day noise (3-Sigma rule)
-        # Bounded explicitly between a tight 3.0% and an 8.0% high-beta max limit
-        computed_limit = float(sample_std * 3.0)
-        return max(0.030, min(computed_limit, 0.080))
+        return max(0.030, min(float(np.std(log_returns) * 3.0), 0.080))
     except Exception:
         return 0.05
 
@@ -66,10 +57,12 @@ def evaluate_position_risk(symbol, ctx):
     try:
         response = requests.get(url, headers=ctx["headers"], timeout=10)
 
+        # Safe exit if position does not exist (0 position account alignment)
         if response.status_code == 404:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.cursor().execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
-                conn.commit()
+            if os.path.exists(DB_PATH):
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.cursor().execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
+                    conn.commit()
             return
 
         if response.status_code != 200:
@@ -79,23 +72,18 @@ def evaluate_position_risk(symbol, ctx):
         live_price = float(position_data["current_price"])
         now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # Request 1Min historical bar matrix since order execution time window
         fill_time_dt = get_max_fill_time(symbol, ctx)
-        if not fill_time_dt:
-            fill_time_str = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        else:
-            fill_time_str = fill_time_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        fill_time_str = fill_time_dt.strftime('%Y-%m-%dT%H:%M:%SZ') if fill_time_dt else now_str
 
         bars_url = "https://data.alpaca.markets/v2/stocks/bars"
         params = {
             "symbols": symbol,
             "timeframe": "1Min",
             "start": fill_time_str,
-            "end": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "end": now_str,
             "feed": "iex"
         }
 
-        # Pull 1m historical segments to track trailing high peaks
         max_high = live_price
         bars_resp = requests.get(bars_url, headers=ctx["headers"], params=params, timeout=10)
         if bars_resp.status_code == 200:
@@ -103,7 +91,6 @@ def evaluate_position_risk(symbol, ctx):
             if bars:
                 max_high = max([float(bar["h"]) for bar in bars])
 
-        # Request separate 15-minute array blocks to execute the volatility math logic
         params["timeframe"] = "15Min"
         params["start"] = (datetime.now(timezone.utc) - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -113,7 +100,6 @@ def evaluate_position_risk(symbol, ctx):
             vol_bars = vol_resp.json().get("bars", {}).get(symbol, [])
             vol_loss_limit = calculate_volatility_stop(vol_bars)
 
-        # Upsert metrics straight to SQLite relational memory matrix row
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -126,43 +112,65 @@ def evaluate_position_risk(symbol, ctx):
             """, (symbol, fill_time_str, max_high, vol_loss_limit, now_str, live_price))
             conn.commit()
 
-        sys.stderr.write(f"[*] Dynamic Calibration [{symbol}] Calculated Noise Buffer Stop-Loss: {vol_loss_limit*100:.2f}%\n")
-
     except Exception as e:
-        sys.stderr.write(f"[!] Risk engine tracking crash for {symbol}: {e}\n")
+        sys.stderr.write(f"[!] Position risk processing exception for {symbol}: {e}\n")
 
 def fetch_alpha_stream(symbol, ctx):
-    url = "https://data.alpaca.markets/v2/stocks/bars"
+    url = "https://data.sandbox.alpaca.markets/v2/stocks/bars"
+    # url = "https://data.alpaca.markets/v2/stocks/bars"
+
+    # Isolate a purely timezone-aware UTC clock object first
+    now_utc = datetime.now(timezone.utc)
+    #start_date = (now_utc - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    #end_date = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Shift lookback window back to secure a populated trading window on weekends
+    start_date = (now_utc - timedelta(days=33)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_date   = (now_utc - timedelta(days=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
     params = {
         "symbols": symbol,
         "timeframe": "15Min",
-        "start": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-        "end": datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        "feed": "iex"
+        "start": start_date,
+        "end": end_date,
+        "feed": "sip"
     }
     try:
         response = requests.get(url, headers=ctx["headers"], params=params, timeout=15)
-        if response.status_code == 200:
-            bars = response.json().get("bars", {}).get(symbol, [])
-            if bars:
-                payload = {
-                    "symbol": symbol,
-                    "timestamps": [b["t"] for bar in bars],
-                    "open": [float(b["o"]) for b in bars],
-                    "high": [float(b["h"]) for b in bars],
-                    "low": [float(b["l"]) for b in bars],
-                    "close": [float(b["c"]) for b in bars],
-                    "volume": [int(b["v"]) for b in bars]
-                }
-                print(json.dumps(payload))
+        if response.status_code != 200:
+            sys.stderr.write(f"[-] Data API error {response.status_code} for {symbol}\n")
+            return
+
+        res_data = response.json()
+        bars = res_data.get("bars", {}).get(symbol, [])
+        if not bars:
+            return
+
+        # FIXED: Loop mappings correctly aligned to use 'bar' index variable
+        payload = {
+            "symbol": symbol,
+            "timestamps": [bar["t"] for bar in bars],
+            "open": [float(bar["o"]) for bar in bars],
+            "high": [float(bar["h"]) for bar in bars],
+            "low": [float(bar["l"]) for bar in bars],
+            "close": [float(bar["c"]) for bar in bars],
+            "volume": [int(bar["v"]) for bar in bars]
+        }
+
+        print(json.dumps(payload))
+
     except Exception as e:
-        print(json.dumps({"symbol": symbol, "error": str(e)}))
+        sys.stderr.write(f"[!] Alpha generation exception for {symbol}: {e}\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(1)
+
     target_symbol = sys.argv[1].upper()
     ctx = get_alpaca_context()
-    if ctx:
-        evaluate_position_risk(target_symbol, ctx)
-        fetch_alpha_stream(target_symbol, ctx)
+
+    if not ctx:
+        sys.stderr.write(f"[!] Invalid context or keys for ticker context: {target_symbol}\n")
+        sys.exit(1)
+
+    evaluate_position_risk(target_symbol, ctx)
+    fetch_alpha_stream(target_symbol, ctx)

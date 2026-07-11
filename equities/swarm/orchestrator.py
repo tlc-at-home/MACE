@@ -27,7 +27,8 @@ async def run_swarm_pipeline_for_asset(symbol):
     scout_proc = await asyncio.create_subprocess_exec(
         sys.executable, scout_path, symbol,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        env=os.environ
     )
     scout_stdout, scout_stderr = await scout_proc.communicate()
     if scout_proc.returncode != 0:
@@ -251,6 +252,7 @@ async def run_sweep(args):
 
     for res in scan_results:
         if "error" in res:
+            print(f"[!] Worker Error for symbol {res.get('symbol')}: {res['error']}")
             errors.append(res)
         else:
             scanned_count += 1
