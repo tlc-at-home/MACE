@@ -19,11 +19,14 @@ import argparse
 from datetime import datetime
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
+from google.antigravity.hooks import hooks
+import sqlite3
 
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 MQTT_BROKER_IP = "192.168.0.110"
 MQTT_PORT = 1883
@@ -98,8 +101,116 @@ def get_alpaca_context():
 # ==============================================================================
 # 3. GEMINI MCP EXECUTION
 # ==============================================================================
+def set_ctx_val(context, key, value):
+    if hasattr(context, "set"):
+        context.set(key, value)
+    else:
+        context.set_state(key, value)
+
+def get_ctx_val(context, key, default=None):
+    if hasattr(context, "get"):
+        return context.get(key, default)
+    else:
+        return context.get_state(key, default)
+
+class MACEPreToolCallHook(hooks.PreToolCallDecideHook):
+    def __init__(self, run_id, db_path):
+        self.run_id = run_id
+        self.db_path = db_path
+
+    async def run(self, context, data):
+        if data.id:
+            set_ctx_val(context, f"args_{data.id}", data.args)
+            set_ctx_val(context, f"name_{data.id}", data.name)
+        return types.HookResult(allow=True)
+
+class MACEPostToolCallHook(hooks.PostToolCallHook):
+    def __init__(self, run_id, db_path):
+        self.run_id = run_id
+        self.db_path = db_path
+
+    async def run(self, context, data):
+        args = get_ctx_val(context, f"args_{data.id}", {}) if data.id else {}
+        symbol = args.get("symbol")
+        action = "SELL" if "close_position" in str(data.name) else None
+        
+        trade_id = None
+        if symbol and action:
+            try:
+                with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT trade_id FROM mcp_requested_trades WHERE run_id = ? AND symbol = ? AND action = ? AND status = 'PENDING'",
+                        (self.run_id, symbol, action)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        trade_id = row[0]
+                    else:
+                        cursor.execute(
+                            "INSERT INTO mcp_requested_trades (run_id, symbol, action, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (self.run_id, symbol, action, "PENDING", datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+                        )
+                        trade_id = cursor.lastrowid
+                        conn.commit()
+            except Exception as e:
+                print(f"[!] Failed to insert/lookup trade request for {symbol}: {e}")
+
+        status_str = "SUCCESS" if not data.error else "FAILED"
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                conn.execute("""
+                    INSERT INTO mcp_execution_log (run_id, trade_id, timestamp, tool_name, arguments, status, result, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    self.run_id,
+                    trade_id,
+                    datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    str(data.name),
+                    json.dumps(args),
+                    status_str,
+                    json.dumps(data.result) if data.result is not None else None,
+                    data.error
+                ))
+                if trade_id:
+                    new_trade_status = "COMPLETED" if status_str == "SUCCESS" else "FAILED"
+                    conn.execute(
+                        "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE trade_id = ?",
+                        (new_trade_status, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), trade_id)
+                    )
+                conn.commit()
+        except Exception as e:
+            print(f"[!] Failed to log tool execution: {e}")
+
+class MACEToolErrorHook(hooks.OnToolErrorHook):
+    def __init__(self, run_id, db_path):
+        self.run_id = run_id
+        self.db_path = db_path
+
+    async def run(self, context, data):
+        error_msg = str(data)
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                conn.execute("""
+                    INSERT INTO mcp_execution_log (run_id, timestamp, tool_name, arguments, status, error)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    self.run_id,
+                    datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    "UNHANDLED_EXCEPTION",
+                    "{}",
+                    "FAILED",
+                    error_msg
+                ))
+                conn.commit()
+        except Exception as e:
+            print(f"[!] Failed to log tool execution exception: {e}")
+        return None
+
 async def run_qualitative_audit():
     logger.info("[*] Booting M.A.C.E. Qualitative News Guard...")
+    run_id = f"news_guard_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    logger.info(f"[*] Starting News Guard run: {run_id}")
 
     context_data = get_alpaca_context()
     if not context_data:
@@ -127,14 +238,20 @@ async def run_qualitative_audit():
         )
     ]
 
+    pre_tool_hook = MACEPreToolCallHook(run_id, DEFAULT_DB_PATH)
+    post_tool_hook = MACEPostToolCallHook(run_id, DEFAULT_DB_PATH)
+    tool_error_hook = MACEToolErrorHook(run_id, DEFAULT_DB_PATH)
+
     config = LocalAgentConfig(
         model="gemini-2.5-flash",
         system_instructions=SYSTEM_PROMPT,
         mcp_servers=mcp_servers,
+        hooks=[pre_tool_hook, post_tool_hook, tool_error_hook],
     )
 
     logger.info("[*] Handing news context to Gemini 2.5 Flash for qualitative analysis...")
 
+    response_text = ""
     async with Agent(config=config) as agent:
         max_retries = 3
         retry_delay = 10
@@ -154,12 +271,66 @@ async def run_qualitative_audit():
 
         if response:
             try:
-                text_content = await response.text()
-                return text_content if text_content else json.dumps({"status": "safe", "details": "Agent returned empty response."})
+                response_text = await response.text()
             except Exception:
-                return json.dumps({"status": "safe", "details": "News audit completed, tool execution assumed successful."})
+                response_text = json.dumps({"status": "safe", "details": "News audit completed, tool execution assumed successful."})
         else:
-            return json.dumps({"error": "No response generated by news guard agent."})
+            response_text = json.dumps({"error": "No response generated by news guard agent."})
+
+    # ==========================================
+    # RECOVERY LOOP FOR FAILED LIQUIDATIONS
+    # ==========================================
+    for attempt in range(1, 4):
+        failed_trades = []
+        try:
+            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT trade_id, symbol FROM mcp_requested_trades WHERE run_id = ? AND status = 'FAILED'",
+                    (run_id,)
+                )
+                failed_trades = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"[!] News Guard recovery query failed: {e}")
+            break
+
+        if not failed_trades:
+            break
+
+        logger.warning(f"[!] News Guard Recovery Attempt {attempt}/3: Retrying {len(failed_trades)} failed liquidations.")
+        
+        try:
+            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                for t in failed_trades:
+                    conn.execute(
+                        "UPDATE mcp_requested_trades SET status = 'PENDING', updated_at = ? WHERE trade_id = ?",
+                        (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), t[0])
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"[!] Failed to reset trade statuses for retry: {e}")
+
+        symbols_to_close = [t[1] for t in failed_trades]
+        recovery_prompt = (
+            f"You are M.A.C.E. News Guard trade execution recovery agent.\n"
+            f"The previous attempt to liquidate the following high-risk positions failed:\n"
+            f"{', '.join(symbols_to_close)}\n\n"
+            f"Please retry calling the `mcp_alpaca_close_position` tool immediately for each symbol."
+        )
+        
+        recovery_config = LocalAgentConfig(
+            model="gemini-2.5-flash",
+            system_instructions="You are a recovery agent. Call mcp_alpaca_close_position for the requested symbols.",
+            mcp_servers=mcp_servers,
+            hooks=[pre_tool_hook, post_tool_hook, tool_error_hook],
+        )
+        
+        async with Agent(config=recovery_config) as recovery_agent:
+            await recovery_agent.chat(recovery_prompt)
+        
+        await asyncio.sleep(5)
+
+    return response_text
 
 # ==============================================================================
 # 4. TELEMETRY & MAIN LOOP
