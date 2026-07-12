@@ -57,6 +57,10 @@ def load_universe():
 def push_mqtt_telemetry(payload):
     try:
         client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        user = os.environ.get("MQTT_USER")
+        password = os.environ.get("MQTT_PASSWORD")
+        if user and password:
+            client.username_pw_set(user, password)
         client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
         client.publish(MQTT_TOPIC, json.dumps(payload))
         client.disconnect()
