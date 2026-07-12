@@ -177,6 +177,42 @@ All services run as background daemons orchestrated by Systemd configurations. T
    * The equities orchestrator scans assets in parallel. Although defensive rate-limiting spacing (`asyncio.sleep(0.2)`) and semaphore limiting are applied, large universes can still hit Alpaca and CCXT rate-limits.
    * *Recommendation*: Implement centralized token-bucket rate limiters in the scouts or coordinate queries using global connection pools.
 
-3. **Error Resilience in MCP Sessions**:
-   * The `execute_mcp_agent` method in `equities/swarm/orchestrator.py` and `tradfi_news_guard.py` implements retries for network spikes, but doesn't handle partial execution failures (e.g., if one order fails while others succeed).
-   * *Recommendation*: Parse individual tool outputs in detail and record state in a persistent execution log to enable automated recovery from half-filled or failed orders.
+3. **Error Resilience in MCP Sessions** [RESOLVED]:
+   * Previously, `execute_mcp_agent` relied on raw network retries but lacked structured recovery from partial execution failures (e.g. if one order fails while others succeed).
+   * *Resolution*: Implemented lifecycle hooks (`PreToolCall`, `PostToolCall`, `OnToolError`) backed by a persistent execution log (`mcp_requested_trades` and `mcp_execution_log`) to track intended vs. executed trades. Added an automated recovery loop that detects failed trades and dispatches up to 3 retries using a targeted recovery agent.
+
+---
+
+## 7. MCP Session Error Resilience & Automated Recovery
+
+To prevent partial execution failures (e.g., half-filled sweeps or failed liquidations), the system integrates structured lifecycle hooks from the Google Antigravity SDK and a persistent recovery state engine.
+
+```mermaid
+graph TD
+    A[Start Orchestrator / News Guard Sweep] --> B[Generate Unique Run ID]
+    B --> C[Compute Target Allocations]
+    C --> D[Write Intended Trades to mcp_requested_trades as PENDING]
+    D --> E[Launch Gemini 2.5 Flash MCP Agent]
+    E --> F{Tool Call Triggered?}
+    F -- Yes --> G[PreToolCallHook: Record args/name in context]
+    G --> H[Execute Tool Call]
+    H --> I[PostToolCallHook: Log to mcp_execution_log]
+    I --> J{Tool Success?}
+    J -- Yes --> K[Update trade status to COMPLETED]
+    J -- No --> L[Update trade status to FAILED]
+    F -- No --> M[Complete initial Agent Chat]
+    K --> N[Start Recovery Check Loop]
+    L --> N
+    M --> N
+    N --> O{Any FAILED/PENDING trades remaining?}
+    O -- Yes (Attempt < 3) --> P[Reset status to PENDING]
+    P --> Q[Launch Recovery Agent with targeted retry prompt]
+    Q --> E
+    O -- No / Max Retries --> R[Finalize Sweep & Publish MQTT Telemetry]
+```
+
+### Lifecycle Hooks
+- **`MACEPreToolCallHook`**: Intercepts the tool call before dispatching to capture arguments and store them in the operational context.
+- **`MACEPostToolCallHook`**: Logs the tool execution status, parameters, and result to `mcp_execution_log` (linked via `trade_id` foreign key) and updates the matching request status to `COMPLETED` or `FAILED`.
+- **`MACEToolErrorHook`**: Intercepts unhandled tool exceptions and registers them as `FAILED` execution records.
+
