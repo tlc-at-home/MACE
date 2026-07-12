@@ -113,11 +113,11 @@ The crypto pipeline is designed around a simulated multi-chain sandbox and runs 
 
 M.A.C.E. implements three parallel, asynchronous risk mitigation layers to protect capital against both sudden mathematical price drops and qualitative market panics.
 
-### I. Deterministic Crypto Shield ([crypto_shield.py](file:///mnt/MACE/crypto/crypto_shield.py))
+### I. Volatility-Calibrated Crypto Shield ([crypto_shield.py](file:///mnt/MACE/crypto/crypto_shield.py))
 * **Interval**: Runs every 15 minutes as a systemd service.
-* **Mechanism**: Pulls the active crypto holdings from `portfolio.db` and queries CCXT (Binance spot) for live prices.
-* **Rule**: Enforces a strict, deterministic **8% single-position stop-loss**.
-* **Action**: If triggered, deletes the holding from the virtual ledger and converts the asset size back to USDT cash.
+* **Mechanism**: Pulls active holdings from `portfolio.db`, fetches live spot prices via CCXT (KuCoin with Binance failover), and queries the `crypto_hwm` table.
+* **Rule**: Enforces a dynamic, volatility-calibrated trailing stop-loss (calibrated by the scout between a tight **3.0% and 8.0% limit** based on 3-Sigma historical log returns of 1h candles over 30 days).
+* **Action**: If the drawdown from the High-Water Mark (HWM) breaches the limit, liquidates the position, resets HWM tracking, and returns recovered cash to the USDT wallet. Dynamically ratchets the HWM up if prices set new peaks.
 
 ### II. Deterministic TradFi Shield ([tradfi_shield.py](file:///mnt/MACE/equities/tradfi_shield.py))
 * **Interval**: Runs every 1 minute.
@@ -169,9 +169,9 @@ All services run as background daemons orchestrated by Systemd configurations. T
 > [!NOTE]
 > Below are structural optimizations and operational enhancements that can be made to increase reliability and scalability.
 
-1. **SQLite Concurrent Write Safety**:
-   * The `portfolio.db` database is accessed by both the `crypto_shield.py` script (every 15m) and `crypto/swarm/orchestrator.py` (every 4h). While sqlite3 URI with `nolock=1` is used, concurrent database writes during execution passes can lead to `database is locked` errors.
-   * *Recommendation*: Enable **Write-Ahead Logging (WAL)** mode on the database connection, or implement a retry loop in the SQLite connection helper.
+1. **SQLite Concurrent Write Safety** [RESOLVED]:
+   * Previously, `portfolio.db` suffered from write failures due to a faulty `?nolock=1` SQLite parameter and connection leaks when scripts encountered exceptions.
+   * *Resolution*: Removed `?nolock=1` (which blocks write transactions), implemented standard SQLite connections with a robust `timeout=30.0` retry queue, and added strict try/finally cleanup structures to prevent resource leaks under exceptions.
 
 2. **API Rate-Limiting & Jitter Management**:
    * The equities orchestrator scans assets in parallel. Although defensive rate-limiting spacing (`asyncio.sleep(0.2)`) and semaphore limiting are applied, large universes can still hit Alpaca and CCXT rate-limits.
