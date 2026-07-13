@@ -32,7 +32,7 @@ def push_mqtt_telemetry(payload):
         if user and password:
             client.username_pw_set(user, password)
         client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.publish(MQTT_TOPIC, json.dumps(payload), retain=True)
         client.disconnect()
     except Exception as e:
         logger.error(f"[!] Telemetry update path bottlenecked: {e}")

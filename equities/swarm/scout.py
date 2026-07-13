@@ -116,7 +116,7 @@ def evaluate_position_risk(symbol, ctx):
         sys.stderr.write(f"[!] Position risk processing exception for {symbol}: {e}\n")
 
 def fetch_alpha_stream(symbol, ctx):
-    url = "https://data.sandbox.alpaca.markets/v2/stocks/bars"
+    url = "https://data.alpaca.markets/v2/stocks/bars"
     # url = "https://data.alpaca.markets/v2/stocks/bars"
 
     # Isolate a purely timezone-aware UTC clock object first

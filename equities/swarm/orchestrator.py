@@ -159,7 +159,7 @@ def push_telemetry(payload):
             mqttc.username_pw_set(user, password)
         mqttc.connect(MQTT_BROKER, MQTT_PORT, 10)
         mqttc.loop_start()
-        info = mqttc.publish(MQTT_TOPIC, json.dumps(payload))
+        info = mqttc.publish(MQTT_TOPIC, json.dumps(payload), retain=True)
         info.wait_for_publish(timeout=5)
         mqttc.loop_stop()
         mqttc.disconnect()
