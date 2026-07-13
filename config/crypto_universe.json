@@ -300,31 +300,6 @@
     "category": "Decentralized Physical Infrastructure and Artificial Intelligence Compute"
   },
   {
-    "ticker": "USDT",
-    "asset_name": "Tether",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USDC",
-    "asset_name": "USD Coin",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USDS",
-    "asset_name": "USDS",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "sUSDS",
-    "asset_name": "sUSDS",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USDE",
-    "asset_name": "Ethena USDe",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
     "ticker": "ONDO",
     "asset_name": "Ondo",
     "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
@@ -357,46 +332,6 @@
   {
     "ticker": "XAUt",
     "asset_name": "Tether Gold",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "TUSD",
-    "asset_name": "TrueUSD",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USD1",
-    "asset_name": "World Liberty USD",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USDD",
-    "asset_name": "USDD",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "sDAI",
-    "asset_name": "sDAI",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "DAI",
-    "asset_name": "Dai",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "GHO",
-    "asset_name": "GHO Stablecoin",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "PYUSD",
-    "asset_name": "PayPal USD",
-    "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
-  },
-  {
-    "ticker": "USDG",
-    "asset_name": "Global Dollar",
     "category": "Stablecoin Liquidity Layers and Tokenized Real World Assets"
   },
   {
@@ -498,5 +433,70 @@
     "ticker": "VELVET",
     "asset_name": "Velvet",
     "category": "Exchange Ecosystems, Cultural Assets, and Programmable Privacy Networks"
+  },
+  {
+    "ticker": "UNI",
+    "asset_name": "Uniswap",
+    "category": "Decentralized Finance and Yield Platforms"
+  },
+  {
+    "ticker": "JUP",
+    "asset_name": "Jupiter",
+    "category": "Decentralized Finance and Yield Platforms"
+  },
+  {
+    "ticker": "RAY",
+    "asset_name": "Raydium",
+    "category": "Decentralized Finance and Yield Platforms"
+  },
+  {
+    "ticker": "PENDLE",
+    "asset_name": "Pendle",
+    "category": "Decentralized Finance and Yield Platforms"
+  },
+  {
+    "ticker": "ENA",
+    "asset_name": "Ethena",
+    "category": "Decentralized Finance and Yield Platforms"
+  },
+  {
+    "ticker": "TAO",
+    "asset_name": "Bittensor",
+    "category": "Decentralized Physical Infrastructure and Artificial Intelligence Compute"
+  },
+  {
+    "ticker": "FET",
+    "asset_name": "Artificial Superintelligence Alliance",
+    "category": "Decentralized Physical Infrastructure and Artificial Intelligence Compute"
+  },
+  {
+    "ticker": "AKT",
+    "asset_name": "Akash Network",
+    "category": "Decentralized Physical Infrastructure and Artificial Intelligence Compute"
+  },
+  {
+    "ticker": "WIF",
+    "asset_name": "dogwifhat",
+    "category": "Exchange Ecosystems, Cultural Assets, and Programmable Privacy Networks"
+  },
+  {
+    "ticker": "BONK",
+    "asset_name": "Bonk",
+    "category": "Exchange Ecosystems, Cultural Assets, and Programmable Privacy Networks"
+  },
+  {
+    "ticker": "POPCAT",
+    "asset_name": "Popcat",
+    "category": "Exchange Ecosystems, Cultural Assets, and Programmable Privacy Networks"
+  },
+  {
+    "ticker": "FLOKI",
+    "asset_name": "Floki",
+    "category": "Exchange Ecosystems, Cultural Assets, and Programmable Privacy Networks"
+  },
+  {
+    "ticker": "ARB",
+    "asset_name": "Arbitrum",
+    "category": "Layer-1 Protocol Anchor Layer"
   }
 ]
