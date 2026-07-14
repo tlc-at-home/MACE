@@ -54,21 +54,18 @@ class CryptoShield:
         logger.info("[*] Autonomous Trailing Defensive Shield Connected. Source: KuCoin")
 
     async def fetch_live_price(self, pair):
-        target_pair = pair.replace("_", "/")
-        try:
-            ticker = await asyncio.to_thread(self.primary_exchange.fetch_ticker, target_pair)
-            return float(ticker['last'])
-        except (ccxt.BadSymbol, ccxt.MarketNotReady, ccxt.ExchangeError):
+            target_pair = pair.replace("_", "/")
             try:
-                logger.warning(f"[-] Synced feed failed or symbol {target_pair} unavailable on KuCoin. Failover routing to Binance...")
-                ticker = await asyncio.to_thread(self.fallback_exchange.fetch_ticker, target_pair)
+                ticker = await asyncio.to_thread(self.primary_exchange.fetch_ticker, target_pair)
                 return float(ticker['last'])
-            except Exception as backup_error:
-                logger.error(f"[!] Critical Error: Ticker lookup failed for {target_pair} across both pools: {backup_error}")
-                return None
-        except Exception as e:
-            logger.error(f"[!] Unexpected error fetching price for {target_pair}: {e}")
-            return None
+            except (ccxt.BadSymbol, ccxt.NetworkError, ccxt.ExchangeError) as e:
+                try:
+                    logger.warning(f"[-] Synced feed failed or symbol {target_pair} unavailable on KuCoin ({str(e)}). Failover routing to Binance...")
+                    ticker = await asyncio.to_thread(self.fallback_exchange.fetch_ticker, target_pair)
+                    return float(ticker['last'])
+                except Exception as backup_error:
+                    logger.error(f"[!] Critical Error: Ticker lookup failed for {target_pair} across both pools: {backup_error}")
+                    return None
 
     async def run_shield_cycle(self):
         logger.info("[*] Commencing deterministic 15-minute risk trailing sweep...")
@@ -80,8 +77,23 @@ class CryptoShield:
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # Extract active assets with entry price columns
-            cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE quantity > 0 AND token != 'USDT'")
+            # Clean up any existing stablecoins in crypto_hwm
+            cursor.execute("""
+                DELETE FROM crypto_hwm 
+                WHERE symbol IN (
+                    'USDT/USDT', 'USDC/USDT', 'USDE/USDT', 'USDS/USDT', 
+                    'DAI/USDT', 'FDUSD/USDT', 'TUSD/USDT', 'USDP/USDT', 'USDD/USDT'
+                )
+            """)
+            conn.commit()
+
+            # Extract active assets with entry price columns, excluding stablecoins
+            cursor.execute("""
+                SELECT token, quantity, avg_entry_price 
+                FROM portfolio 
+                WHERE quantity > 0 
+                  AND token NOT IN ('USDT', 'USDC', 'USDE', 'USDS', 'DAI', 'FDUSD', 'TUSD', 'USDP', 'USDD')
+            """)
             active_positions = cursor.fetchall()
 
             # We also query the cash balance (USDT)

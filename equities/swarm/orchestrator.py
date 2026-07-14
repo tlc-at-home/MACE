@@ -425,7 +425,7 @@ async def run_sweep(args):
             sell_prompt = (
                 f"You are M.A.C.E. risk manager.\n"
                 f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
-                f"Call the `mcp_alpaca_close_position` tool for each symbol to close the full position."
+                f"Call the `alpaca_close_position` tool for each symbol to close the full position."
             )
             print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
             sell_result = await execute_mcp_agent(sell_prompt, "Execute the sell orders now.", run_id)
@@ -450,7 +450,7 @@ async def run_sweep(args):
             print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
             buy_prompt = (
                 f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
-                f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
+                f"Take the following list of trades and call the `alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
                 f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
                 f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
                 f"TRADES TO EXECUTE:\n{trades_description}\n\n"
@@ -493,11 +493,11 @@ async def run_sweep(args):
             
             if retry_sells:
                 sells_desc = "\n".join([f"- Symbol: '{t[1]}' (Close position)" for t in retry_sells])
-                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `mcp_alpaca_close_position` tool for each symbol."
+                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `alpaca_close_position` tool for each symbol."
             
             if retry_buys:
                 buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
-                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
+                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
 
             recovery_prompt += "\n\nExecute the recovery tool calls now."
             

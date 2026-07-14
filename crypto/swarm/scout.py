@@ -12,8 +12,20 @@ async def evaluate_position_risk(symbol, exchange):
     Calculates dynamic trailing stop-loss percentage from volatility of 1h candles over 30 days.
     """
     token = symbol.split("/")[0]
+    STABLECOINS = {"USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP", "USDD"}
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     db_path = os.path.join(base_dir, "config/portfolio.db")
+
+    if token in STABLECOINS:
+        try:
+            if os.path.exists(db_path):
+                with sqlite3.connect(db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (symbol,))
+                    conn.commit()
+        except Exception as e:
+            sys.stderr.write(f"[!] Stablecoin risk bypass exception for {symbol}: {e}\n")
+        return
 
     try:
         if not os.path.exists(db_path):
