@@ -62,7 +62,10 @@ def push_mqtt_telemetry(payload):
         if user and password:
             client.username_pw_set(user, password)
         client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, json.dumps(payload), retain=True)
+        client.loop_start()
+        info = client.publish(MQTT_TOPIC, json.dumps(payload), retain=True)
+        info.wait_for_publish(timeout=5)
+        client.loop_stop()
         client.disconnect()
     except Exception as e:
         logger.error(f"[!] Asynchronous telemetry network link bottleneck: {e}")
