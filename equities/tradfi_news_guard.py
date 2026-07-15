@@ -22,14 +22,40 @@ from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
 import sqlite3
 
+def safe_json_dumps(obj):
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj)
+    except TypeError:
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            try:
+                return json.dumps(obj.model_dump())
+            except Exception:
+                pass
+        elif hasattr(obj, "dict") and callable(obj.dict):
+            try:
+                return json.dumps(obj.dict())
+            except Exception:
+                pass
+        if hasattr(obj, "__dict__"):
+            try:
+                return json.dumps(obj, default=lambda o: o.__dict__ if hasattr(o, "__dict__") else str(o))
+            except Exception:
+                pass
+        try:
+            return json.dumps(str(obj))
+        except Exception:
+            return '"unserializable"'
+
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
-MQTT_BROKER_IP = "192.168.0.110"
-MQTT_PORT = 1883
+MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/tradfi_news_guard"
 
 # STRICT QUALITATIVE RISK PROMPT
@@ -167,9 +193,9 @@ class MACEPostToolCallHook(hooks.PostToolCallHook):
                     trade_id,
                     datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                     str(data.name),
-                    json.dumps(args),
+                    safe_json_dumps(args),
                     status_str,
-                    json.dumps(data.result) if data.result is not None else None,
+                    safe_json_dumps(data.result) if data.result is not None else None,
                     data.error
                 ))
                 if trade_id:

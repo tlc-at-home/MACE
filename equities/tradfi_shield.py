@@ -16,9 +16,10 @@ from datetime import datetime
 import paho.mqtt.client as mqtt_client
 import alpaca_trade_api as tradeapi
 
-DEFAULT_DB_PATH = "/home/fedora/MACE/config/portfolio.db"
-MQTT_BROKER_IP = "192.168.0.110"
-MQTT_PORT = 1883
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/tradfi_shield"
 
 def push_mqtt_telemetry(payload):

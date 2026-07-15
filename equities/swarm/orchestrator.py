@@ -9,6 +9,32 @@ from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
 import sqlite3
 
+def safe_json_dumps(obj):
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj)
+    except TypeError:
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            try:
+                return json.dumps(obj.model_dump())
+            except Exception:
+                pass
+        elif hasattr(obj, "dict") and callable(obj.dict):
+            try:
+                return json.dumps(obj.dict())
+            except Exception:
+                pass
+        if hasattr(obj, "__dict__"):
+            try:
+                return json.dumps(obj, default=lambda o: o.__dict__ if hasattr(o, "__dict__") else str(o))
+            except Exception:
+                pass
+        try:
+            return json.dumps(str(obj))
+        except Exception:
+            return '"unserializable"'
+
 DEFAULT_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config/portfolio.db"))
 
 # Base Paths
@@ -16,8 +42,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_UNIVERSE_PATH = os.path.join(BASE_DIR, "config/tradfi_universe.json")
 
 # MQTT Broker config
-MQTT_BROKER = "192.168.0.110"
-MQTT_PORT = 1883
+MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/tradfi_sword"
 
 async def run_swarm_pipeline_for_asset(symbol):
@@ -231,9 +257,9 @@ class MACEPostToolCallHook(hooks.PostToolCallHook):
                     trade_id,
                     datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                     str(data.name),
-                    json.dumps(args),
+                    safe_json_dumps(args),
                     status_str,
-                    json.dumps(data.result) if data.result is not None else None,
+                    safe_json_dumps(data.result) if data.result is not None else None,
                     data.error
                 ))
                 if trade_id:
@@ -425,7 +451,7 @@ async def run_sweep(args):
             sell_prompt = (
                 f"You are M.A.C.E. risk manager.\n"
                 f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
-                f"Call the `alpaca_close_position` tool for each symbol to close the full position."
+                f"Call the `mcp_alpaca_close_position` tool for each symbol to close the full position."
             )
             print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
             sell_result = await execute_mcp_agent(sell_prompt, "Execute the sell orders now.", run_id)
@@ -450,7 +476,7 @@ async def run_sweep(args):
             print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
             buy_prompt = (
                 f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
-                f"Take the following list of trades and call the `alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
+                f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
                 f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
                 f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
                 f"TRADES TO EXECUTE:\n{trades_description}\n\n"
@@ -493,11 +519,11 @@ async def run_sweep(args):
             
             if retry_sells:
                 sells_desc = "\n".join([f"- Symbol: '{t[1]}' (Close position)" for t in retry_sells])
-                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `alpaca_close_position` tool for each symbol."
+                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `mcp_alpaca_close_position` tool for each symbol."
             
             if retry_buys:
                 buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
-                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
+                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
 
             recovery_prompt += "\n\nExecute the recovery tool calls now."
             

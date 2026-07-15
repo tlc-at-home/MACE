@@ -13,7 +13,8 @@ import requests
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-DB_PATH = "/home/fedora/MACE/config/portfolio.db"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 def get_alpaca_context():
     # Clean environmental values of literal surrounding quotes if present

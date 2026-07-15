@@ -12,7 +12,8 @@ import requests
 import numpy as np
 from datetime import datetime, timezone
 
-DB_PATH = "/home/fedora/MACE/config/portfolio.db"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 def get_context():
     api_key = os.environ.get("ALPACA_API_KEY")

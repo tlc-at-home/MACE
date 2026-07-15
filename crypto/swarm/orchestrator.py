@@ -19,8 +19,8 @@ UNIVERSE_PATH = os.path.join(BASE_DIR, "config/crypto_universe.json")
 sys.path.append(os.path.join(BASE_DIR, "crypto/swarm"))
 import guardrail
 
-MQTT_BROKER_IP = "192.168.0.110"
-MQTT_PORT = 1883
+MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/crypto_sword"
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
