@@ -182,11 +182,8 @@ class CryptoShield:
                     else:
                         logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
 
-                    # Execute atomic database balance swap and reset the tracking anchors
-                    try:
-                        cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0, high_water_mark = 0 WHERE token = ?", (token,))
-                    except sqlite3.OperationalError:
-                        cursor.execute("UPDATE portfolio SET quantity = 0, avg_entry_price = 0 WHERE token = ?", (token,))
+                    # Delete the liquidated position from the portfolio and clear its high-water-mark tracking
+                    cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
                     cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
                     cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
                     conn.commit()
