@@ -114,6 +114,16 @@ async def process_single_asset_pipeline(symbol, semaphore):
 
 async def execute_swarm_sweep(args):
     logger.info("[*] Initializing broad market swarm processing sweep...")
+    # Publish SCANNING state to MQTT to force Home Assistant state update
+    start_payload = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "engine": "crypto_sword",
+        "status": "SCANNING",
+        "top_regime_signal": {"ticker": "N/A", "regime": "N/A", "calculated_kelly": 0.0, "signal_strength": 0.0},
+        "execution_payload": {"status": "SCANNING", "allocated_dollars": 0.0}
+    }
+    await asyncio.to_thread(push_mqtt_telemetry, start_payload)
+
     guardrail.init_db()
     raw_universe = load_universe()
     if args.limit:
