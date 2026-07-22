@@ -5,6 +5,32 @@ import sqlite3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
+DEFAULT_TRADFI_SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "LLY", "AVGO",
+    "JPM", "V", "UNH", "WMT", "XOM", "MA", "JNJ", "PG", "HD", "COST",
+    "ORCL", "ABBV", "BAC", "CRM", "NFLX", "CVX", "KO", "AMD", "PEP", "TMO",
+    "MRK", "WFC", "LIN", "ADBE", "DIS", "PM", "CSCO", "MCD", "GE", "ACN",
+    "INTU", "IBM", "QCOM", "CAT", "TXN", "AMAT", "BKNG", "NOW", "ISRG", "SPGI",
+    "CMCSA", "GS", "HON", "AXP", "AMGN", "RTX", "LOW", "BK", "NEE", "PFE",
+    "UNP", "COP", "MS", "TJX", "BLK", "DE", "LMT", "BA", "T", "SPG",
+    "SCHW", "SYK", "NKE", "C", "UBER", "VRTX", "ADI", "PLTR", "MDLZ", "ELV",
+    "MMC", "CB", "ADP", "CI", "PANW", "BX", "LRCX", "GILD", "ETN", "REGN",
+    "FI", "PGR", "SBUX", "CL", "SO", "PDD", "DUK", "SLB", "MO", "AON"
+]
+
+DEFAULT_CRYPTO_PAIRS = [
+    "WBTC/USDT", "WETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "DOT/USDT", "LINK/USDT",
+    "MATIC/USDT", "SHIB/USDT", "LTC/USDT", "BCH/USDT", "UNI/USDT", "NEAR/USDT", "APT/USDT", "ICP/USDT", "FIL/USDT", "ETC/USDT",
+    "STX/USDT", "XMR/USDT", "ATOM/USDT", "LDO/USDT", "ARBT/USDT", "OP/USDT", "INJ/USDT", "TIA/USDT", "RNDR/USDT", "FET/USDT",
+    "SUI/USDT", "SEI/USDT", "PEPE/USDT", "FLOKI/USDT", "BONK/USDT", "WIF/USDT", "POPCAT/USDT", "JUP/USDT", "PYTH/USDT", "ONDO/USDT",
+    "PENDLE/USDT", "ENA/USDT", "ATH/USDT", "BEAT/USDT", "JST/USDT", "SUSHI/USDT", "ASTER/USDT", "TRX/USDT", "PAXG/USDT", "COMP/USDT",
+    "AAVE/USDT", "MKR/USDT", "SNX/USDT", "CRV/USDT", "CVX/USDT", "LDO/USDT", "RPL/USDT", "FXS/USDT", "BAL/USDT", "DYDX/USDT",
+    "GMX/USDT", "KNC/USDT", "ZRX/USDT", "1INCH/USDT", "ENJ/USDT", "CHZ/USDT", "SAND/USDT", "MANA/USDT", "AXS/USDT", "GALA/USDT",
+    "IMX/USDT", "BEAM/USDT", "ILV/USDT", "YGG/USDT", "ALICE/USDT", "TLM/USDT", "SUPER/USDT", "RON/USDT", "PRIME/USDT", "MAGIC/USDT",
+    "MC/USDT", "GMT/USDT", "AUDIO/USDT", "RARE/USDT", "HIGH/USDT", "TVK/USDT", "VOXEL/USDT", "DAR/USDT", "SLP/USDT", "MBOX/USDT",
+    "ALU/USDT", "REVV/USDT"
+]
+
 def migrate():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -104,6 +130,23 @@ def migrate():
         cursor.execute("DROP TABLE crypto_universe")
         print("[+] Migrated crypto_universe table to asset_universe.")
 
+    # 6. Fallback Seed if asset_universe is empty
+    cursor.execute("SELECT COUNT(*) FROM asset_universe")
+    if cursor.fetchone()[0] == 0:
+        print("[*] Seeding default asset_universe records...")
+        for sym in DEFAULT_TRADFI_SYMBOLS:
+            cursor.execute("""
+                INSERT OR IGNORE INTO asset_universe (symbol, asset_class, broker, exchange, currency)
+                VALUES (?, 'TRADFI', 'alpaca', 'SMART', 'USD')
+            """, (sym,))
+
+        for pair in DEFAULT_CRYPTO_PAIRS:
+            cursor.execute("""
+                INSERT OR IGNORE INTO asset_universe (symbol, asset_class, broker, exchange, currency)
+                VALUES (?, 'CRYPTO', 'binance', 'BINANCE', 'USDT')
+            """, (pair,))
+        print("[+] Seeded asset_universe with 100 TradFi symbols and 92 Crypto pairs.")
+
     conn.commit()
 
     # Re-insert HWM rows with matching asset_id
@@ -129,7 +172,7 @@ def migrate():
 
     conn.commit()
 
-    # 6. Optimization Database Views
+    # 7. Optimization Database Views
     cursor.execute("DROP VIEW IF EXISTS vw_tradfi_universe")
     cursor.execute("""
         CREATE VIEW vw_tradfi_universe AS
