@@ -44,6 +44,7 @@ def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
     conn = sqlite3.connect(abs_db_path, timeout=30.0)
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -76,16 +77,6 @@ class CryptoShield:
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-
-            # Clean up any existing stablecoins in crypto_hwm
-            cursor.execute("""
-                DELETE FROM crypto_hwm 
-                WHERE symbol IN (
-                    'USDT/USDT', 'USDC/USDT', 'USDE/USDT', 'USDS/USDT', 
-                    'DAI/USDT', 'FDUSD/USDT', 'TUSD/USDT', 'USDP/USDT', 'USDD/USDT'
-                )
-            """)
-            conn.commit()
 
             # Extract active assets with entry price columns, excluding stablecoins
             cursor.execute("""
@@ -131,21 +122,27 @@ class CryptoShield:
                 if live_price is None:
                     continue
 
-                # Query trailing stop-loss metrics from crypto_hwm
-                cursor.execute("SELECT high_water_mark, loss_limit FROM crypto_hwm WHERE symbol = ?", (pair,))
+                # Query trailing stop-loss metrics from vw_crypto_risk_corridors view
+                cursor.execute("SELECT high_water_mark, loss_limit, stop_floor_price FROM vw_crypto_risk_corridors WHERE symbol = ?", (pair,))
                 hwm_row = cursor.fetchone()
                 if hwm_row:
                     hwm = float(hwm_row["high_water_mark"])
                     loss_limit = float(hwm_row["loss_limit"])
+                    calc_floor = float(hwm_row["stop_floor_price"])
                 else:
                     hwm = max(cost_basis, live_price)
                     loss_limit = 0.08
+                    calc_floor = hwm * (1 - loss_limit)
                     now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO crypto_hwm (symbol, high_water_mark, loss_limit, updated_at)
-                        VALUES (?, ?, ?, ?)
-                    """, (pair, hwm, loss_limit, now_str))
-                    conn.commit()
+                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE pair = ?", (pair,))
+                    a_row = cursor.fetchone()
+                    if a_row:
+                        asset_id = a_row[0]
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO crypto_hwm (asset_id, symbol, high_water_mark, loss_limit, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (asset_id, pair, hwm, loss_limit, now_str))
+                        conn.commit()
 
                 # Peak Ratchet: If the price breaks a new high, lock it into database state immediately
                 if live_price > hwm:
@@ -155,16 +152,11 @@ class CryptoShield:
                         logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.4f} -> ${live_price:.4f}")
                     hwm = live_price
                     cursor.execute("UPDATE crypto_hwm SET high_water_mark = ? WHERE symbol = ?", (hwm, pair))
-                    # Also update the portfolio table column if present
-                    try:
-                        cursor.execute("UPDATE portfolio SET high_water_mark = ? WHERE token = ?", (hwm, token))
-                    except sqlite3.OperationalError:
-                        pass
                     conn.commit()
 
                 # Compute drawdown metrics relative directly to the Peak High Water Mark
                 trailing_drawdown_pct = (live_price - hwm) / hwm
-                floor_price = hwm * (1 - loss_limit)
+                floor_price = calc_floor
 
                 # Dynamic conditional formatting blocks based on asset scale properties
                 if live_price < 0.01:
@@ -182,13 +174,25 @@ class CryptoShield:
                     else:
                         logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
 
+                    # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
+                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE pair = ?", (pair,))
+                    a_row = cursor.fetchone()
+                    if a_row:
+                        asset_id = a_row[0]
+                        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                        cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        cursor.execute("""
+                            INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
+                            VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
+                        """, (asset_id, pair, now_str, cooldown_until_str))
+
                     # Delete the liquidated position from the portfolio and clear its high-water-mark tracking
                     cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
                     cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
                     cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
                     conn.commit()
                     current_usdt_balance += usdt_recovered
-                    breach_details.append(f"{pair} stopped out at trailing floor.")
+                    breach_details.append(f"{pair} stopped out at trailing floor. 24h Cooldown Lock registered.")
                 else:
                     total_holdings_value += qty * live_price
                     positions_telemetry.append({

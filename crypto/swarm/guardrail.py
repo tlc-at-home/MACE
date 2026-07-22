@@ -23,6 +23,7 @@ def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
     conn = sqlite3.connect(abs_db_path, timeout=30.0)
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -31,6 +32,32 @@ def init_db(db_path=DEFAULT_DB_PATH):
     cursor = conn.cursor()
 
     try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS asset_universe (
+                asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                asset_class TEXT NOT NULL,
+                asset_name TEXT,
+                category TEXT,
+                broker TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                UNIQUE(symbol, broker, exchange)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trade_cooldowns (
+                cooldown_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                cooldown_until TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES asset_universe(asset_id) ON DELETE CASCADE
+            )
+        """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
                 blockchain TEXT PRIMARY KEY,
@@ -52,12 +79,63 @@ def init_db(db_path=DEFAULT_DB_PATH):
         """)
 
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS crypto_hwm (
-                symbol TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS equities_hwm (
+                asset_id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                last_fill_time TEXT,
                 high_water_mark REAL NOT NULL,
                 loss_limit REAL NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES asset_universe(asset_id) ON DELETE CASCADE
             )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_hwm (
+                asset_id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                high_water_mark REAL NOT NULL,
+                loss_limit REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES asset_universe(asset_id) ON DELETE CASCADE
+            )
+        """)
+
+        # Views
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS vw_tradfi_universe AS
+            SELECT asset_id, symbol, broker, exchange, currency, asset_name, category
+            FROM asset_universe WHERE asset_class = 'TRADFI'
+        """)
+
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS vw_crypto_universe AS
+            SELECT asset_id, symbol, broker, exchange, currency AS pair, asset_name, category
+            FROM asset_universe WHERE asset_class = 'CRYPTO'
+        """)
+
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS vw_active_cooldowns AS
+            SELECT c.cooldown_id, c.asset_id, c.symbol, a.asset_class, a.broker, a.exchange, c.closed_at, c.reason, c.cooldown_until
+            FROM trade_cooldowns c
+            JOIN asset_universe a ON c.asset_id = a.asset_id
+            WHERE c.cooldown_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        """)
+
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS vw_equities_risk_corridors AS
+            SELECT h.asset_id, h.symbol, a.broker, a.exchange, a.currency, h.last_fill_time, h.high_water_mark, h.loss_limit,
+                   (h.high_water_mark * (1.0 - h.loss_limit)) AS stop_floor_price, h.updated_at
+            FROM equities_hwm h
+            JOIN asset_universe a ON h.asset_id = a.asset_id
+        """)
+
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS vw_crypto_risk_corridors AS
+            SELECT h.asset_id, h.symbol, a.broker, a.exchange, h.high_water_mark, h.loss_limit,
+                   (h.high_water_mark * (1.0 - h.loss_limit)) AS stop_floor_price, h.updated_at
+            FROM crypto_hwm h
+            JOIN asset_universe a ON h.asset_id = a.asset_id
         """)
 
         cursor.execute("SELECT COUNT(*) FROM wallets")
@@ -251,6 +329,16 @@ def run_piped_risk_gate(brain_output_str):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # Check Post-Liquidation Cooldown Lock via vw_active_cooldowns
+        cursor.execute("SELECT symbol FROM vw_active_cooldowns WHERE symbol = ?", (ticker,))
+        if cursor.fetchone():
+            return {
+                "status": "gate_closed",
+                "ticker": ticker,
+                "allocated_dollars": 0.0,
+                "reason": "Asset in post-liquidation cooldown lock."
+            }
+
         cursor.execute("SELECT quantity FROM portfolio WHERE blockchain = 'ARBITRUM' AND token = 'USDT'")
         cash_row = cursor.fetchone()
         available_usdt = float(cash_row["quantity"]) if cash_row else 0.0

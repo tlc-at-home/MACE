@@ -39,7 +39,10 @@ DEFAULT_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", 
 
 # Base Paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DEFAULT_UNIVERSE_PATH = os.path.join(BASE_DIR, "config/tradfi_universe.json")
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+from brokers import get_client_by_name
 
 # MQTT Broker config
 MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
@@ -89,49 +92,44 @@ async def sem_pipeline(symbol, sem):
         await asyncio.sleep(0.2)  # Defensive rate-limit spacing
         return res
 
+def load_tradfi_universe(db_path=DEFAULT_DB_PATH, limit=None):
+    symbols = []
+    if os.path.exists(db_path):
+        try:
+            with sqlite3.connect(db_path, timeout=10.0) as conn:
+                cursor = conn.cursor()
+                query = "SELECT symbol FROM vw_tradfi_universe ORDER BY symbol"
+                if limit:
+                    query += f" LIMIT {int(limit)}"
+                rows = cursor.execute(query).fetchall()
+                symbols = [r[0] for r in rows]
+        except Exception as e:
+            print(f"[!] Error querying vw_tradfi_universe from DB: {e}")
+    if not symbols:
+        print("[!] DB universe lookup empty. Defaulting to major assets.")
+        symbols = ["SPY", "AAPL", "MSFT"]
+    return symbols
+
 async def get_equities_portfolio_context():
     """
-    Fetches the total equity and existing positions from Alpaca.
+    Fetches the total equity and existing positions using BrokerClient abstraction.
     """
-    import requests
-
-    # SECURE FIX: Removed hardcoded fallback keys. Relies entirely on mace.env via Systemd.
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret_key = os.environ.get("ALPACA_SECRET_KEY")
-    paper_trade = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() == "true"
-
-    if not api_key or not secret_key:
-        print("[!] Critical: ALPACA_API_KEY or ALPACA_SECRET_KEY not found in environment.")
-        return 0.0, []
-
-    base_url = "https://paper-api.alpaca.markets" if paper_trade else "https://api.alpaca.markets"
-    headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
-
     total_equity = 0.0
     existing_positions = []
 
     try:
-        acc_response = requests.get(f"{base_url}/v2/account", headers=headers, timeout=10)
-        if acc_response.status_code == 200:
-            acc_data = acc_response.json()
-            total_equity = float(acc_data.get("equity", 0.0))
+        client = get_client_by_name("alpaca")
+        acc = client.get_account()
+        total_equity = acc.get("equity", 0.0)
 
-        pos_response = requests.get(f"{base_url}/v2/positions", headers=headers, timeout=10)
-        if pos_response.status_code == 200:
-            for pos in pos_response.json():
-                symbol = pos.get("symbol")
-                if symbol:
-                    existing_positions.append(symbol)
-
-        ord_response = requests.get(f"{base_url}/v2/orders?status=open", headers=headers, timeout=10)
-        if ord_response.status_code == 200:
-            for order in ord_response.json():
-                symbol = order.get("symbol")
-                if symbol and symbol not in existing_positions:
-                    existing_positions.append(symbol)
+        positions = client.get_positions()
+        for pos in positions:
+            symbol = pos.get("symbol")
+            if symbol and symbol not in existing_positions:
+                existing_positions.append(symbol)
 
     except Exception as e:
-        print(f"[!] Error fetching Alpaca portfolio context: {e}")
+        print(f"[!] Error fetching portfolio context via BrokerClient: {e}")
 
     return total_equity, existing_positions
 
@@ -371,17 +369,7 @@ async def run_sweep(args):
     if args.symbols:
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     else:
-        if os.path.exists(DEFAULT_UNIVERSE_PATH):
-            try:
-                with open(DEFAULT_UNIVERSE_PATH, "r") as f:
-                    universe_list = json.load(f)
-                    symbols = universe_list[:args.limit] if args.limit else universe_list
-            except Exception as e:
-                print(f"[!] Error loading universe: {e}")
-                symbols = ["SPY", "AAPL", "MSFT"]
-        else:
-            print("[!] Universe file not found. Defaulting to major assets.")
-            symbols = ["SPY", "AAPL", "MSFT"]
+        symbols = load_tradfi_universe(DEFAULT_DB_PATH, args.limit)
 
     print(f"[*] Starting async scanning of {len(symbols)} equities assets...")
 

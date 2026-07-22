@@ -34,14 +34,14 @@ def audit():
         print(f"[!] Database not found at {DB_PATH}")
         return
 
-    # Ingest historical records managed by scout.py
+    # Ingest historical records managed by scout.py via view
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT symbol, last_fill_time, high_water_mark FROM equities_hwm")
+            cursor.execute("SELECT symbol, last_fill_time, high_water_mark, loss_limit, stop_floor_price FROM vw_equities_risk_corridors")
             rows = cursor.fetchall()
         except sqlite3.OperationalError:
-            print("[!] Table 'equities_hwm' does not exist yet or is empty.")
+            print("[!] View 'vw_equities_risk_corridors' does not exist yet or is empty.")
             return
 
     if not rows:

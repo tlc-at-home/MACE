@@ -10,11 +10,12 @@ import json
 import asyncio
 import argparse
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 import paho.mqtt.client as mqtt_client
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-UNIVERSE_PATH = os.path.join(BASE_DIR, "config/crypto_universe.json")
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 sys.path.append(os.path.join(BASE_DIR, "crypto/swarm"))
 import guardrail
@@ -27,32 +28,20 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger("mace.orchestrator")
 
 def load_universe():
-    """Reads and parses the broad-market token list from the system config directory."""
-    if not os.path.exists(UNIVERSE_PATH):
-        logger.warning(f"Universe profile missing at {UNIVERSE_PATH}. Deploying default core triage targets.")
+    """Reads and parses the broad-market token list from SQLite database."""
+    if not os.path.exists(DEFAULT_DB_PATH):
+        logger.warning(f"Database missing at {DEFAULT_DB_PATH}. Deploying default core triage targets.")
         return ["BTC/USDT", "SOL/USDT", "ETH/USDT", "NEAR/USDT", "AVAX/USDT"]
     try:
-        with open(UNIVERSE_PATH, "r") as f:
-            raw_universe = json.load(f)
-
-        # Ensure root is a list
-        if not isinstance(raw_universe, list):
-            raw_universe = [raw_universe]
-
-        formatted_universe = []
-        for asset in raw_universe:
-            # Strictly enforce new object schema
-            if isinstance(asset, dict) and "ticker" in asset:
-                ticker = asset["ticker"]
-                # CCXT requires a pair format (e.g., WBTC -> WBTC/USDT)
-                if "/" not in ticker:
-                    ticker = f"{ticker}/USDT"
-                formatted_universe.append(ticker)
-
-        return formatted_universe
+        with sqlite3.connect(DEFAULT_DB_PATH) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("SELECT pair FROM vw_crypto_universe ORDER BY symbol").fetchall()
+            if rows:
+                return [r[0] for r in rows]
     except Exception as e:
-        logger.error(f"[-] Critical exception encountered parsing asset registry json disk mapping: {e}")
-        return []
+        logger.error(f"[-] Critical exception querying vw_crypto_universe table: {e}")
+
+    return ["BTC/USDT", "SOL/USDT", "ETH/USDT", "NEAR/USDT", "AVAX/USDT"]
 
 def push_mqtt_telemetry(payload):
     try:
