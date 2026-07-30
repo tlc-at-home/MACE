@@ -212,20 +212,109 @@ async def sync_tradfi_positions(alpaca_client):
     return summary
 
 
+async def sync_crypto_positions():
+    if not os.path.exists(DB_PATH):
+        return []
+
+    summary = []
+    STABLECOINS = {"USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP", "USDD"}
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT token, quantity, avg_entry_price 
+                FROM portfolio 
+                WHERE quantity > 0 
+                  AND token NOT IN ('USDT', 'USDC', 'USDE', 'USDS', 'DAI', 'FDUSD', 'TUSD', 'USDP', 'USDD')
+            """)
+            active_positions = cursor.fetchall()
+
+        if not active_positions:
+            return []
+
+        import ccxt.async_support as ccxt
+        primary_exchange = ccxt.kucoin({'enableRateLimit': True})
+        fallback_exchange = ccxt.binance({'enableRateLimit': True})
+
+        stored_map = get_stored_hwm_map("crypto_hwm")
+
+        with get_db_connection() as conn:
+            for pos in active_positions:
+                token = pos[0]
+                qty = float(pos[1])
+                avg_entry = float(pos[2])
+                pair = f"{token}/USDT"
+
+                asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
+
+                live_price = None
+                bars = []
+
+                # Fetch live price & 1m OHLCV bars via KuCoin with Binance fallback
+                try:
+                    ticker = await primary_exchange.fetch_ticker(pair)
+                    live_price = float(ticker['last'])
+                    ohlcv = await primary_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+                    bars = [{"c": c[4]} for c in ohlcv]
+                except Exception as e:
+                    try:
+                        ticker = await fallback_exchange.fetch_ticker(pair)
+                        live_price = float(ticker['last'])
+                        ohlcv = await fallback_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+                        bars = [{"c": c[4]} for c in ohlcv]
+                    except Exception as fb_err:
+                        logger.warning(f"[!] Failed fetching crypto market data for {pair}: {fb_err}")
+
+                if live_price is None:
+                    continue
+
+                loss_limit = calculate_24h_rolling_volatility_stop(
+                    bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
+                )
+
+                prev_info = stored_map.get(pair, {})
+                prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+                new_hwm = max(prev_hwm, live_price)
+
+                update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
+                floor_price = new_hwm * (1.0 - loss_limit)
+
+                summary.append({
+                    "asset_class": "CRYPTO",
+                    "asset_id": asset_id,
+                    "symbol": pair,
+                    "live_price": live_price,
+                    "hwm": new_hwm,
+                    "loss_limit_pct": round(loss_limit * 100, 2),
+                    "floor_price": round(floor_price, 2)
+                })
+
+        await primary_exchange.close()
+        await fallback_exchange.close()
+
+    except Exception as e:
+        logger.error(f"[!] Crypto positions HWM sync exception: {e}")
+
+    return summary
+
+
 async def run_update_sweep():
     logger.info("[*] Executing 1-minute HWM & 24h rolling volatility calibration pass...")
     alpaca_client = get_client_by_name("alpaca")
 
     tradfi_summary = await sync_tradfi_positions(alpaca_client)
+    crypto_summary = await sync_crypto_positions()
 
-    total_active = len(tradfi_summary)
-    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active}")
+    combined_positions = tradfi_summary + crypto_summary
+    total_active = len(combined_positions)
+    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active} (TradFi: {len(tradfi_summary)}, Crypto: {len(crypto_summary)})")
 
     push_mqtt_telemetry({
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "SYNC_COMPLETE",
         "active_positions_count": total_active,
-        "positions": tradfi_summary
+        "positions": combined_positions
     })
 
 
