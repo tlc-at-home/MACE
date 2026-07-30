@@ -171,14 +171,15 @@ async def sync_tradfi_positions(alpaca_client):
 
             asset_id = get_or_create_asset_id(conn, symbol, asset_class="TRADFI", broker="alpaca")
 
-            # Request 1,440 1-minute bars for 24h volatility profile
+            # Request 1,440 1-minute bars for 24h volatility profile (using IEX feed for paper accounts)
             try:
                 bars = await asyncio.to_thread(
                     alpaca_client.get_historical_bars,
                     symbol,
                     "1Min",
                     start_str,
-                    end_str
+                    end_str,
+                    "iex"
                 )
             except Exception as e:
                 logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")

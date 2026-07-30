@@ -65,19 +65,22 @@ class AlpacaClient(BrokerClient):
             }
         resp.raise_for_status()
 
-    def get_historical_bars(self, symbol: str, timeframe: str, start: str, end: str, feed: str = None) -> list[dict]:
+    def get_historical_bars(self, symbol: str, timeframe: str, start: str, end: str, feed: str = "iex") -> list[dict]:
         self._check_credentials()
         url = f"{self.data_url}/v2/stocks/bars"
         params = {
             "symbols": symbol,
             "timeframe": timeframe,
             "start": start,
-            "end": end
+            "end": end,
+            "feed": feed or "iex"
         }
-        if feed:
-            params["feed"] = feed
 
         resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+        if resp.status_code == 403 and params.get("feed") != "iex":
+            params["feed"] = "iex"
+            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+
         if resp.status_code == 200:
             res_data = resp.json()
             bars = res_data.get("bars", {}).get(symbol, [])
