@@ -1,0 +1,15 @@
+[Unit]
+Description=M.A.C.E. High-Frequency HWM & Dynamic Volatility Stop Loss Updater
+After=network.target
+
+[Service]
+Type=simple
+User=tony
+WorkingDirectory=/home/tony/dev/MACE-LOCAL
+EnvironmentFile=/home/tony/dev/MACE-LOCAL/config/mace.env
+ExecStart=/usr/bin/python3 -u /home/tony/dev/MACE-LOCAL/hwm_stop_updater.py --daemon --interval 60
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

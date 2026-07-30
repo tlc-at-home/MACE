@@ -8,6 +8,9 @@ echo "=================================================================="
 echo "[*] Syncing Systemd service configurations..."
 systemctl daemon-reload
 
+echo "[*] Launching HWM & Volatility Stop Updater (1m interval)..."
+systemctl start mace-hwm-updater.service
+
 echo "[*] Launching Crypto Shield (15m interval)..."
 systemctl start mace-crypto-shield.service
 
@@ -28,6 +31,7 @@ echo "[+] M.A.C.E. Fleet Launch Sequence Complete."
 echo "=================================================================="
 echo ""
 echo "To view live logs for a specific agent, use:"
+echo "  journalctl -u mace-hwm-updater -f"
 echo "  journalctl -u mace-crypto-shield -f"
 echo "  journalctl -u mace-tradfi-shield -f"
 echo "  journalctl -u mace-crypto-orchestrator -f"
