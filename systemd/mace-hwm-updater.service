@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=tony
-WorkingDirectory=/home/tony/dev/MACE-LOCAL
-EnvironmentFile=/home/tony/dev/MACE-LOCAL/config/mace.env
-ExecStart=/usr/bin/python3 -u /home/tony/dev/MACE-LOCAL/hwm_stop_updater.py --daemon --interval 60
+User=fedora
+WorkingDirectory=/home/fedora/MACE
+EnvironmentFile=/home/fedora/MACE/config/mace.env
+ExecStart=/home/fedora/mace_env/bin/python -u /home/fedora/MACE/hwm_stop_updater.py --daemon --interval 60
 Restart=always
 RestartSec=5
 
