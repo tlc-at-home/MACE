@@ -144,16 +144,6 @@ class CryptoShield:
                         """, (asset_id, pair, hwm, loss_limit, now_str))
                         conn.commit()
 
-                # Peak Ratchet: If the price breaks a new high, lock it into database state immediately
-                if live_price > hwm:
-                    if hwm < 0.01 or live_price < 0.01:
-                        logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.8f} -> ${live_price:.8f}")
-                    else:
-                        logger.info(f"[+] NEW PEAK RECORDED: {token} shifted high water mark from ${hwm:.4f} -> ${live_price:.4f}")
-                    hwm = live_price
-                    cursor.execute("UPDATE crypto_hwm SET high_water_mark = ? WHERE symbol = ?", (hwm, pair))
-                    conn.commit()
-
                 # Compute drawdown metrics relative directly to the Peak High Water Mark
                 trailing_drawdown_pct = (live_price - hwm) / hwm
                 floor_price = calc_floor
