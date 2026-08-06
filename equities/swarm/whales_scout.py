@@ -21,7 +21,10 @@ import urllib.parse
 import ssl
 import logging
 from datetime import datetime, timezone
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 # Path setup
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -242,6 +245,10 @@ def fetch_tier4_apify_actor():
 
 def fetch_tier5_capitoltrades_html():
     """Tier 5: CapitolTrades HTML Direct BeautifulSoup Scraper Fallback (No Key Needed)"""
+    if not BeautifulSoup:
+        logger.info("[Tier 5 CapitolTrades WebScraper] beautifulsoup4 (bs4) not installed in python environment; skipping Tier 5.")
+        return []
+
     url = "https://www.capitoltrades.com/trades"
     candidates = []
     try:
