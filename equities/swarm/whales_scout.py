@@ -117,33 +117,39 @@ def remove_whale_candidate_on_sell(conn, symbol, politician=None):
 # ============================================================================
 
 def fetch_tier1_finnhub():
-    """Tier 1: Finnhub.io REST API (/congressional-trading)"""
+    """Tier 1: Finnhub.io REST API (/stock/insider-transactions)"""
     api_key = os.getenv("FINNHUB_API_KEY")
     if not api_key:
         logger.info("[Tier 1 Finnhub API] FINNHUB_API_KEY not set in mace.env; skipping.")
         return []
 
-    url = f"https://finnhub.io/api/v1/congressional-trading?token={api_key}"
+    target_symbols = ["NVDA", "AAPL", "MSFT", "AVGO", "AMZN", "GOOGL", "META", "TSLA"]
     candidates = []
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8"))
-                for item in data.get("data", [])[:50]:
-                    symbol = item.get("symbol", "").strip().upper()
-                    tx_type = item.get("transactionType", "").upper()
-                    if symbol and "BUY" in tx_type:
-                        candidates.append({
-                            "symbol": symbol,
-                            "source": "Finnhub_API",
-                            "politician": item.get("name"),
-                            "transaction_type": "BUY",
-                            "amount_range": item.get("amount")
-                        })
-                logger.info(f"[Tier 1 Finnhub API] Successfully fetched {len(candidates)} candidates.")
-    except Exception as e:
-        logger.warning(f"[Tier 1 Finnhub API] Exception: {e}")
+
+    for sym in target_symbols:
+        url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={sym}&token={api_key}"
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    for item in data.get("data", [])[:10]:
+                        change = item.get("change", 0)
+                        tx_code = item.get("transactionCode", "").upper()
+                        # 'P' = Purchase, positive change = Buy
+                        if tx_code == "P" or change > 0:
+                            candidates.append({
+                                "symbol": sym,
+                                "source": "Finnhub_API",
+                                "politician": item.get("name"),
+                                "transaction_type": "BUY",
+                                "amount_range": f"{item.get('change')} shares @ ${item.get('transactionPrice')}"
+                            })
+        except Exception as e:
+            logger.warning(f"[Tier 1 Finnhub API] Symbol {sym} exception: {e}")
+
+    if candidates:
+        logger.info(f"[Tier 1 Finnhub API] Successfully fetched {len(candidates)} insider/whale candidates.")
     return candidates
 
 def fetch_tier2_stock_watcher():
