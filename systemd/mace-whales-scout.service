@@ -4,9 +4,9 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-User=tony
-WorkingDirectory=/home/tony/dev/MACE-LOCAL
-ExecStart=/usr/bin/python3 /home/tony/dev/MACE-LOCAL/equities/swarm/whales_scout.py
-EnvironmentFile=/home/tony/dev/MACE-LOCAL/config/mace.env
+User=fedora
+WorkingDirectory=/home/fedora/MACE
+ExecStart=/home/fedora/mace_env/bin/python /home/fedora/MACE/equities/swarm/whales_scout.py
+EnvironmentFile=/home/fedora/MACE/config/mace.env
 StandardOutput=journal
 StandardError=journal
