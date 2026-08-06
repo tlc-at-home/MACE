@@ -106,7 +106,7 @@ class TradFiShield:
                     with sqlite3.connect(DEFAULT_DB_PATH) as conn:
                         conn.execute("PRAGMA foreign_keys = ON;")
                         cursor = conn.cursor()
-                        cursor.execute("SELECT asset_id FROM vw_tradfi_universe WHERE symbol = ?", (symbol,))
+                        cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
                         row = cursor.fetchone()
                         if row:
                             asset_id = row[0]

@@ -1,0 +1,12 @@
+[Unit]
+Description=M.A.C.E. Political & Whale Trade Ingestion Scout
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=tony
+WorkingDirectory=/home/tony/dev/MACE-LOCAL
+ExecStart=/usr/bin/python3 /home/tony/dev/MACE-LOCAL/equities/swarm/whales_scout.py
+EnvironmentFile=/home/tony/dev/MACE-LOCAL/config/mace.env
+StandardOutput=journal
+StandardError=journal

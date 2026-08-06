@@ -1,0 +1,10 @@
+[Unit]
+Description=Runs M.A.C.E. Whales Scout twice daily during US trading days
+
+[Timer]
+OnCalendar=Mon..Fri 12:30:00 US/Eastern
+OnCalendar=Mon..Fri 18:30:00 US/Eastern
+Persistent=true
+
+[Install]
+WantedBy=timers.target

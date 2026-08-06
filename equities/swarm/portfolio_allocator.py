@@ -39,12 +39,21 @@ def run_portfolio_guardrail():
         approved_trades = []
         trim_sell_orders = []
 
+        kelly_whale_mult = float(os.environ.get("KELLY_WHALE_MULT", "1.25"))
+        kelly_static_mult = float(os.environ.get("KELLY_STATIC_MULT", "1.00"))
+
         # 1. First Pass: Filter out active cooldowns, illegal regimes, failed ML, and current holdings
         for asset in candidates:
             symbol = asset.get("symbol")
             current_state = asset.get("current_state")
             ml_confirmed = asset.get("ml_confirmed", False)
-            calculated_kelly = float(asset.get("calculated_kelly", 0.0))
+            source = asset.get("source", "static")
+            base_kelly = float(asset.get("calculated_kelly", 0.0))
+
+            # Apply source-aware Kelly conviction multiplier
+            multiplier = kelly_whale_mult if source != "static" else kelly_static_mult
+            calculated_kelly = base_kelly * multiplier
+            asset["calculated_kelly"] = round(calculated_kelly, 4)
 
             # Filter active cooldown lock (Post-Liquidation Risk Gate)
             if symbol in active_cooldowns:

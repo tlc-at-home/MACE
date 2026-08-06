@@ -49,7 +49,7 @@ MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/tradfi_sword"
 
-async def run_swarm_pipeline_for_asset(symbol):
+async def run_swarm_pipeline_for_asset(symbol, source="static"):
     """
     Spawns scout.py and brain.py using UNIX pipes as async subprocesses.
     """
@@ -82,33 +82,37 @@ async def run_swarm_pipeline_for_asset(symbol):
         brain_data = json.loads(brain_stdout.decode().strip())
         if "error" in brain_data:
             return {"symbol": symbol, "error": brain_data["error"]}
+        brain_data["source"] = source
         return brain_data
     except Exception as e:
         return {"symbol": symbol, "error": f"Failed to parse brain output: {str(e)}"}
 
-async def sem_pipeline(symbol, sem):
+async def sem_pipeline(symbol, source, sem):
     async with sem:
-        res = await run_swarm_pipeline_for_asset(symbol)
+        res = await run_swarm_pipeline_for_asset(symbol, source)
         await asyncio.sleep(0.2)  # Defensive rate-limit spacing
         return res
 
 def load_tradfi_universe(db_path=DEFAULT_DB_PATH, limit=None):
     symbols = []
+    sources = {}
     if os.path.exists(db_path):
         try:
             with sqlite3.connect(db_path, timeout=10.0) as conn:
                 cursor = conn.cursor()
-                query = "SELECT symbol FROM vw_tradfi_universe ORDER BY symbol"
+                query = "SELECT symbol, source FROM vw_equities_universe ORDER BY symbol"
                 if limit:
                     query += f" LIMIT {int(limit)}"
                 rows = cursor.execute(query).fetchall()
                 symbols = [r[0] for r in rows]
+                sources = {r[0]: r[1] for r in rows}
         except Exception as e:
-            print(f"[!] Error querying vw_tradfi_universe from DB: {e}")
+            print(f"[!] Error querying vw_equities_universe from DB: {e}")
     if not symbols:
         print("[!] DB universe lookup empty. Defaulting to major assets.")
         symbols = ["SPY", "AAPL", "MSFT"]
-    return symbols
+        sources = {s: "static" for s in symbols}
+    return symbols, sources
 
 async def get_equities_portfolio_context():
     """
@@ -366,15 +370,17 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
 
 async def run_sweep(args):
     symbols = []
+    sources = {}
     if args.symbols:
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        sources = {s: "static" for s in symbols}
     else:
-        symbols = load_tradfi_universe(DEFAULT_DB_PATH, args.limit)
+        symbols, sources = load_tradfi_universe(DEFAULT_DB_PATH, args.limit)
 
     print(f"[*] Starting async scanning of {len(symbols)} equities assets...")
 
     sem = asyncio.Semaphore(3)
-    tasks = [sem_pipeline(symbol, sem) for symbol in symbols]
+    tasks = [sem_pipeline(symbol, sources.get(symbol, "static"), sem) for symbol in symbols]
     scan_results = await asyncio.gather(*tasks)
 
     raw_signals = []

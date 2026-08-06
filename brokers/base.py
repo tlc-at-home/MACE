@@ -61,7 +61,7 @@ def get_client_for_symbol(symbol: str, db_path: str = DEFAULT_DB_PATH) -> Broker
         try:
             with sqlite3.connect(db_path, timeout=10.0) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT broker FROM vw_tradfi_universe WHERE symbol = ?", (symbol,))
+                cursor.execute("SELECT broker FROM vw_equities_universe WHERE symbol = ?", (symbol,))
                 row = cursor.fetchone()
                 if row and row[0]:
                     broker_name = row[0]

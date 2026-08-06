@@ -103,8 +103,8 @@ def init_db(db_path=DEFAULT_DB_PATH):
 
         # Views
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS vw_tradfi_universe AS
-            SELECT asset_id, symbol, broker, exchange, currency, asset_name, category
+            CREATE VIEW IF NOT EXISTS vw_equities_universe AS
+            SELECT asset_id, symbol, 'static' AS source, broker, exchange, currency, asset_name, category, NULL AS politician, NULL AS transaction_type
             FROM asset_universe WHERE asset_class = 'TRADFI'
         """)
 

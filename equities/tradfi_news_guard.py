@@ -66,7 +66,7 @@ def close_position_tool(symbol: str) -> str:
             with sqlite3.connect(DEFAULT_DB_PATH) as conn:
                 conn.execute("PRAGMA foreign_keys = ON;")
                 cursor = conn.cursor()
-                cursor.execute("SELECT asset_id FROM vw_tradfi_universe WHERE symbol = ?", (symbol,))
+                cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
                 row = cursor.fetchone()
                 if row:
                     asset_id = row[0]
@@ -83,13 +83,13 @@ def close_position_tool(symbol: str) -> str:
         return f"Failed to liquidate position for {symbol}: {str(e)}"
 
 def load_tradfi_universe_metadata():
-    """Loads all symbols and their metadata from SQLite vw_tradfi_universe view."""
+    """Loads all symbols and their metadata from SQLite vw_equities_universe view."""
     universe = []
     if os.path.exists(DEFAULT_DB_PATH):
         try:
             with sqlite3.connect(DEFAULT_DB_PATH) as conn:
                 cursor = conn.cursor()
-                rows = cursor.execute("SELECT asset_id, symbol, broker, exchange, currency FROM vw_tradfi_universe").fetchall()
+                rows = cursor.execute("SELECT asset_id, symbol, broker, exchange, currency FROM vw_equities_universe").fetchall()
                 for r in rows:
                     universe.append({
                         "asset_id": r[0],
@@ -99,7 +99,7 @@ def load_tradfi_universe_metadata():
                         "currency": r[4]
                     })
         except Exception as e:
-            logger.error(f"[-] Failed to load vw_tradfi_universe from DB: {e}")
+            logger.error(f"[-] Failed to load vw_equities_universe from DB: {e}")
     return universe
 
 def map_yahoo_ticker(symbol: str, exchange: str) -> str:
