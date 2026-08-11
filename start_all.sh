@@ -9,25 +9,25 @@ echo "[*] Syncing Systemd service configurations..."
 systemctl daemon-reload
 
 echo "[*] Launching HWM & Volatility Stop Updater (1m interval)..."
-systemctl start mace-hwm-updater.service
+systemctl enable --now mace-hwm-updater.service
 
 echo "[*] Launching Crypto Shield (15m interval)..."
-systemctl start mace-crypto-shield.service
+systemctl enable --now mace-crypto-shield.service
 
 echo "[*] Launching TradFi Shield (1m interval)..."
-systemctl start mace-tradfi-shield.service
+systemctl enable --now mace-tradfi-shield.service
 
 echo "[*] Launching Crypto Swarm (4h interval)..."
-systemctl start mace-crypto-orchestrator.service
+systemctl enable --now mace-crypto-orchestrator.service
 
 echo "[*] Launching Equities Swarm (1h interval)..."
-systemctl start mace-equities-orchestrator.service
+systemctl enable --now mace-equities-orchestrator.service
 
 echo "[*] Launching TradFi News Guard (4h interval)..."
-systemctl start mace-tradfi-news-guard.service
+systemctl enable --now mace-tradfi-news-guard.service
 
 echo "[*] Launching Whales & Political Disclosure Scout (Twice daily timer)..."
-systemctl start mace-whales-scout.timer
+systemctl enable --now mace-whales-scout.timer
 
 echo "=================================================================="
 echo "[+] M.A.C.E. Fleet Launch Sequence Complete."
