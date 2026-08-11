@@ -116,15 +116,17 @@ def load_tradfi_universe(db_path=DEFAULT_DB_PATH, limit=None):
 
 async def get_equities_portfolio_context():
     """
-    Fetches the total equity and existing positions using BrokerClient abstraction.
+    Fetches the total equity, available cash, and existing positions using BrokerClient abstraction.
     """
     total_equity = 0.0
+    available_cash = 0.0
     existing_positions = []
 
     try:
         client = get_client_by_name("alpaca")
         acc = client.get_account()
-        total_equity = acc.get("equity", 0.0)
+        total_equity = float(acc.get("equity", 0.0))
+        available_cash = float(acc.get("cash", 0.0))
 
         positions = client.get_positions()
         for pos in positions:
@@ -135,18 +137,17 @@ async def get_equities_portfolio_context():
     except Exception as e:
         print(f"[!] Error fetching portfolio context via BrokerClient: {e}")
 
-    return total_equity, existing_positions
+    return total_equity, available_cash, existing_positions
 
-async def process_global_risk(raw_signals, total_equity, active_positions):
+async def process_global_risk(raw_signals, total_equity, available_cash, active_positions):
     """
     Feeds the accumulated brain signals into the centralized portfolio allocator via a single pipe stream.
     """
     allocator_path = os.path.join(BASE_DIR, "equities/swarm/portfolio_allocator.py")
 
-    # FIX: Map variables correctly for the downstream allocator
     allocator_input = {
         "candidates": raw_signals,
-        "available_cash": total_equity,
+        "available_cash": available_cash,
         "total_equity": total_equity,
         "existing_positions": active_positions
     }
@@ -398,12 +399,11 @@ async def run_sweep(args):
     print(f"[+] Scan completed. Scanned: {scanned_count}, Raw Alpha Candidates: {len(raw_signals)}, Errors: {len(errors)}")
 
     print("[*] Retrieving Alpaca portfolio context...")
-    total_equity, active_positions = await get_equities_portfolio_context()
-    available_cash = total_equity
-    print(f"[+] Cash/Equity Available: {available_cash} USD, Existing Holdings/Orders: {active_positions}")
+    total_equity, available_cash, active_positions = await get_equities_portfolio_context()
+    print(f"[+] Cash Available: {available_cash} USD, Total Equity: {total_equity} USD, Existing Holdings/Orders: {active_positions}")
 
     print("[*] Running centralized global portfolio risk and sizing allocation...")
-    approved_trades, sell_orders = await process_global_risk(raw_signals, total_equity, active_positions)
+    approved_trades, sell_orders = await process_global_risk(raw_signals, total_equity, available_cash, active_positions)
     print(f"[+] Allocation completed. Approved Trades: {len(approved_trades)}, Sell Orders: {len(sell_orders)}")
 
     approved_trades = sorted(approved_trades, key=lambda x: x.get("signal_strength", 0.0), reverse=True)
