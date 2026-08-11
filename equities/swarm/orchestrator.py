@@ -3,7 +3,7 @@ import json
 import asyncio
 import os
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
@@ -548,7 +548,7 @@ async def run_sweep(args):
 
     # Dispatch Telemetry
     telemetry_payload = {
-        "timestamp": str(datetime.now()),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "engine": "EQUITIES_SWARM",
         "scan_summary": {
             "total_scanned_count": scanned_count,

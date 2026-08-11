@@ -19,7 +19,7 @@ import requests
 import argparse
 import sqlite3
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
 
@@ -228,7 +228,7 @@ def push_telemetry(result):
         mqttc.connect(MQTT_BROKER_IP, MQTT_PORT, 10)
         mqttc.loop_start()
 
-        payload = {"timestamp": str(datetime.now()), "engine": "TRADFI_NEWS_GUARD", "report": result}
+        payload = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "engine": "TRADFI_NEWS_GUARD", "report": result}
         info = mqttc.publish(MQTT_TOPIC, json.dumps(payload))
         info.wait_for_publish(timeout=5)
 
