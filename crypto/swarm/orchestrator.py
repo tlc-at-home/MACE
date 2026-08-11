@@ -11,7 +11,7 @@ import asyncio
 import argparse
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import paho.mqtt.client as mqtt_client
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -105,10 +105,10 @@ async def execute_swarm_sweep(args):
     logger.info("[*] Initializing broad market swarm processing sweep...")
     # Publish SCANNING state to MQTT to force Home Assistant state update
     start_payload = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "engine": "crypto_sword",
         "status": "SCANNING",
-        "top_regime_signal": {"ticker": "N/A", "regime": "N/A", "calculated_kelly": 0.0, "signal_strength": 0.0},
+        "top_regime_signal": {"ticker": "Evaluating...", "regime": "Scanning", "calculated_kelly": 0.0, "signal_strength": 0.0},
         "execution_payload": {"status": "SCANNING", "allocated_dollars": 0.0}
     }
     await asyncio.to_thread(push_mqtt_telemetry, start_payload)
@@ -182,7 +182,7 @@ async def execute_swarm_sweep(args):
                         execution_status = "REJECTED_BY_LEDGER"
 
         telemetry_payload = {
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "engine": "crypto_sword",
             "status": "SCAN_COMPLETE",
             "top_regime_signal": {"ticker": symbol, "regime": regime, "calculated_kelly": kelly_fraction, "signal_strength": signal_strength},
