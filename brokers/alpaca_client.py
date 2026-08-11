@@ -114,6 +114,21 @@ class AlpacaClient(BrokerClient):
             sys.stderr.write(f"[!] Order history search drop for {symbol}: {e}\n")
         return None
 
+    def place_order(self, symbol: str, notional: float, side: str, type: str, time_in_force: str) -> dict:
+        self._check_credentials()
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "notional": notional,
+            "side": side,
+            "type": type,
+            "time_in_force": time_in_force
+        }
+        resp = requests.post(url, headers=self.headers, json=order_data, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        resp.raise_for_status()
+
     def close_position(self, symbol: str) -> None:
         self._check_credentials()
         url = f"{self.base_url}/v2/positions/{symbol}"

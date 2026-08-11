@@ -147,11 +147,13 @@ All services run as background daemons orchestrated by Systemd configurations. T
 
 | Daemon Service | Target Script | Run Frequency | Telemetry Topic |
 | :--- | :--- | :--- | :--- |
+| `mace-hwm-updater.service` | `hwm_stop_updater.py` | 1 minute | `mace/telemetry/hwm_updater` |
 | `mace-crypto-shield.service` | `crypto/crypto_shield.py` | 15 minutes | `mace/telemetry/crypto_shield` |
 | `mace-tradfi-shield.service` | `equities/tradfi_shield.py` | 1 minute | `mace/telemetry/tradfi_shield` |
 | `mace-crypto-orchestrator.service` | `crypto/swarm/orchestrator.py` | 4 hours (UTC synchronized) | `mace/telemetry/crypto_sword` |
 | `mace-equities-orchestrator.service` | `equities/swarm/orchestrator.py` | 1 hour | `mace/telemetry/tradfi_sword` |
 | `mace-tradfi-news-guard.service` | `equities/tradfi_news_guard.py` | 4 hours | `mace/telemetry/tradfi_news_guard` |
+| `mace-whales-scout.timer` / `.service` | `equities/swarm/whales_scout.py` | Twice daily (US trading days) | `mace/telemetry/whales_scout` |
 
 ---
 

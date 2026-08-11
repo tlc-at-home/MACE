@@ -26,6 +26,9 @@ systemctl start mace-equities-orchestrator.service
 echo "[*] Launching TradFi News Guard (4h interval)..."
 systemctl start mace-tradfi-news-guard.service
 
+echo "[*] Launching Whales & Political Disclosure Scout (Twice daily timer)..."
+systemctl start mace-whales-scout.timer
+
 echo "=================================================================="
 echo "[+] M.A.C.E. Fleet Launch Sequence Complete."
 echo "=================================================================="
@@ -37,6 +40,7 @@ echo "  journalctl -u mace-tradfi-shield -f"
 echo "  journalctl -u mace-crypto-orchestrator -f"
 echo "  journalctl -u mace-equities-orchestrator -f"
 echo "  journalctl -u mace-tradfi-news-guard -f"
+echo "  journalctl -u mace-whales-scout -f"
 echo ""
 echo "To check the health/status of all agents:"
 echo "  systemctl status 'mace-*'"
