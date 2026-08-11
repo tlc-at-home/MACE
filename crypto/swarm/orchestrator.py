@@ -127,6 +127,11 @@ async def execute_swarm_sweep(args):
 
     logger.info("[*] Complete asset matrix evaluated. Processing risk boundaries and execution gates...")
 
+    top_candidate = None
+    best_signal_strength = -1.0
+    overall_execution_status = "IDLE"
+    max_allocated_dollars = 0.0
+
     for signal in brain_signals:
         if not signal or signal.get("status") not in ["success", "insufficient_data"]:
             continue
@@ -136,9 +141,14 @@ async def execute_swarm_sweep(args):
         kelly_fraction = float(signal.get("kelly_fraction", 0.0))
         signal_strength = float(signal.get("signal_strength", 0.0))
 
-        execution_status = "IDLE"
-        allocated_dollars = 0.0
-        telemetry_payload = {}
+        if signal_strength > best_signal_strength:
+            best_signal_strength = signal_strength
+            top_candidate = {
+                "ticker": symbol,
+                "regime": regime,
+                "calculated_kelly": kelly_fraction,
+                "signal_strength": signal_strength
+            }
 
         # ==========================================
         # THE EXIT LOGIC (SELL CONDITION)
@@ -156,9 +166,9 @@ async def execute_swarm_sweep(args):
                 ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
                 if ledger_receipt.get("success"):
                     logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
-                    execution_status = "SOLD_BEAR_REGIME"
+                    overall_execution_status = "SOLD_BEAR_REGIME"
                 else:
-                    execution_status = "SELL_FAILED"
+                    overall_execution_status = "SELL_FAILED"
 
         # ==========================================
         # THE ENTRY LOGIC (BUY CONDITION)
@@ -170,25 +180,29 @@ async def execute_swarm_sweep(args):
                 allocated_dollars = float(verdict.get("allocated_dollars", 0.0))
                 current_price = float(signal.get("current_price", 0.0))
                 if current_price <= 0:
-                    execution_status = "INVALID_PRICE"
+                    overall_execution_status = "INVALID_PRICE"
                 else:
                     trade_qty = allocated_dollars / current_price
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="BUY", quantity=trade_qty, execution_price=current_price)
                     if ledger_receipt.get("success"):
                         logger.info(f"[+] LEDGER TRANSACTION SUCCESS: Bought {trade_qty:.4f} {symbol} at ${current_price:.2f}")
-                        execution_status = "DISPATCHED"
+                        overall_execution_status = "DISPATCHED"
+                        max_allocated_dollars = max(max_allocated_dollars, allocated_dollars)
                     else:
                         logger.warning(f"[-] Ledger transactional entry failure: {ledger_receipt.get('error')}")
-                        execution_status = "REJECTED_BY_LEDGER"
+                        overall_execution_status = "REJECTED_BY_LEDGER"
 
-        telemetry_payload = {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "engine": "crypto_sword",
-            "status": "SCAN_COMPLETE",
-            "top_regime_signal": {"ticker": symbol, "regime": regime, "calculated_kelly": kelly_fraction, "signal_strength": signal_strength},
-            "execution_payload": {"status": execution_status, "allocated_dollars": allocated_dollars}
-        }
-        await asyncio.to_thread(push_mqtt_telemetry, telemetry_payload)
+    if not top_candidate:
+        top_candidate = {"ticker": "N/A", "regime": "Neutral", "calculated_kelly": 0.0, "signal_strength": 0.0}
+
+    telemetry_payload = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "engine": "crypto_sword",
+        "status": "SCAN_COMPLETE",
+        "top_regime_signal": top_candidate,
+        "execution_payload": {"status": overall_execution_status, "allocated_dollars": max_allocated_dollars}
+    }
+    await asyncio.to_thread(push_mqtt_telemetry, telemetry_payload)
 
 async def main_async():
     parser = argparse.ArgumentParser(description="M.A.C.E. Phase 2 Multi-Agent Swarm Orchestrator Engine")
