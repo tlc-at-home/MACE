@@ -43,7 +43,8 @@ class AlpacaClient(BrokerClient):
                     "symbol": p["symbol"],
                     "qty": float(p["qty"]),
                     "current_price": float(p["current_price"]),
-                    "avg_entry_price": float(p["avg_entry_price"])
+                    "avg_entry_price": float(p["avg_entry_price"]),
+                    "market_value": float(p["market_value"])
                 }
                 for p in raw_positions
             ]
@@ -61,7 +62,8 @@ class AlpacaClient(BrokerClient):
                 "symbol": p["symbol"],
                 "qty": float(p["qty"]),
                 "current_price": float(p["current_price"]),
-                "avg_entry_price": float(p["avg_entry_price"])
+                "avg_entry_price": float(p["avg_entry_price"]),
+                    "market_value": float(p["market_value"])
             }
         resp.raise_for_status()
 
