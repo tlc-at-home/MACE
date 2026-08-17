@@ -23,7 +23,7 @@ DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 def fetch_alpha_stream(symbol, client):
     now_utc = datetime.now(timezone.utc)
-    start_date = (now_utc - timedelta(days=150)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_date = (now_utc - timedelta(days=200)).strftime('%Y-%m-%dT%H:%M:%SZ')
     end_date   = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     try:
