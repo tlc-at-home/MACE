@@ -323,8 +323,8 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
                 f"ALPACA_API_KEY={api_key}",
                 f"ALPACA_SECRET_KEY={secret_key}",
                 "ALPACA_PAPER_TRADE=true",
-                uvx_cmd,
-                "alpaca-mcp-server",
+                "python3",
+                os.path.join(BASE_DIR, "alpaca_wrapper.py"),
             ],
         )
     ]
