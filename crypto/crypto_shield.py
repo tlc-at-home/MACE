@@ -134,7 +134,7 @@ class CryptoShield:
                     loss_limit = 0.08
                     calc_floor = hwm * (1 - loss_limit)
                     now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE pair = ?", (pair,))
+                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
                     a_row = cursor.fetchone()
                     if a_row:
                         asset_id = a_row[0]
@@ -165,7 +165,7 @@ class CryptoShield:
                         logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
 
                     # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
-                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE pair = ?", (pair,))
+                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
                     a_row = cursor.fetchone()
                     if a_row:
                         asset_id = a_row[0]

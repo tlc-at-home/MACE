@@ -35,7 +35,7 @@ def load_universe():
     try:
         with sqlite3.connect(DEFAULT_DB_PATH) as conn:
             cursor = conn.cursor()
-            rows = cursor.execute("SELECT pair FROM vw_crypto_universe ORDER BY symbol").fetchall()
+            rows = cursor.execute("SELECT symbol FROM vw_crypto_universe ORDER BY symbol").fetchall()
             if rows:
                 return [r[0] for r in rows]
     except Exception as e:
