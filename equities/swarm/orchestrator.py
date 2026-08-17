@@ -6,7 +6,7 @@ import argparse
 from datetime import datetime, timezone
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
-from google.antigravity.hooks import hooks
+from google.antigravity.hooks import hooks, policy
 import sqlite3
 
 def safe_json_dumps(obj):
@@ -337,7 +337,7 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
         model="gemini-2.5-flash", # Upgraded from Pro to save API quota
         system_instructions=system_prompt,
         mcp_servers=mcp_servers,
-        policies=[hooks.policy.allow_all()],
+        policies=[policy.allow_all()],
         hooks=[pre_tool_hook, post_tool_hook, tool_error_hook],
     )
 
