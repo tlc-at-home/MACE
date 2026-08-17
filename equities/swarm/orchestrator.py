@@ -313,21 +313,28 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     os.environ["ALPACA_SECRET_KEY"] = secret_key
     os.environ["ALPACA_PAPER_TRADE"] = "true"
 
-    uvx_cmd = "/usr/local/bin/uvx" if os.path.exists("/usr/local/bin/uvx") else "uvx"
-
-    mcp_servers = [
-        types.McpStdioServer(
-            name="alpaca",
-            command="/usr/bin/env",
-            args=[
-                f"ALPACA_API_KEY={api_key}",
-                f"ALPACA_SECRET_KEY={secret_key}",
-                "ALPACA_PAPER_TRADE=true",
-                "python3",
-                os.path.join(BASE_DIR, "alpaca_wrapper.py"),
-            ],
-        )
-    ]
+    def mcp_alpaca_place_stock_order(symbol: str, notional: str, side: str, type: str, time_in_force: str) -> str:
+        """Places a stock order on Alpaca."""
+        import requests
+        headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+            "accept": "application/json",
+            "content-type": "application/json"
+        }
+        url = "https://paper-api.alpaca.markets/v2/orders"
+        payload = {
+            "symbol": symbol,
+            "notional": str(notional),
+            "side": side,
+            "type": type,
+            "time_in_force": time_in_force
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload)
+            return resp.text
+        except Exception as e:
+            return str(e)
 
     pre_tool_hook = MACEPreToolCallHook(run_id, DEFAULT_DB_PATH)
     post_tool_hook = MACEPostToolCallHook(run_id, DEFAULT_DB_PATH)
@@ -336,7 +343,7 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     config = LocalAgentConfig(
         model="gemini-2.5-flash", # Upgraded from Pro to save API quota
         system_instructions=system_prompt,
-        mcp_servers=mcp_servers,
+        tools=[mcp_alpaca_place_stock_order],
         policies=[policy.allow_all()],
         hooks=[pre_tool_hook, post_tool_hook, tool_error_hook],
     )
