@@ -337,6 +337,7 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
         model="gemini-2.5-flash", # Upgraded from Pro to save API quota
         system_instructions=system_prompt,
         mcp_servers=mcp_servers,
+        policies=[hooks.policy.allow_all()],
         hooks=[pre_tool_hook, post_tool_hook, tool_error_hook],
     )
 
