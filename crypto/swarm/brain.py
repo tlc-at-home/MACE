@@ -102,7 +102,7 @@ def compute_quantitative_signals(raw_input):
 
     signal_strength = 0.0
     if returns_std > 0:
-        signal_strength = float(recent_returns.mean() / returns_std)
+        signal_strength = float((recent_returns.mean() / returns_std) * np.sqrt(365))
 
     # FIX: Floor confidence at 0.0 (not 0.2) so losing assets get zero allocation
     confidence_multiplier = np.clip(signal_strength, 0.0, 1.0)

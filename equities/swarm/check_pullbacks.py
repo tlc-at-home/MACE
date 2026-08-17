@@ -52,7 +52,7 @@ def audit():
     print(f"{'SYMBOL':<8} | {'ENTRY TIME':<20} | {'PEAK HIGH':<10} | {'MAX INTRA-POSITION PULLBACK':<22} | {'SUGGESTED STOP'}")
     print("=" * 90)
 
-    for symbol, last_fill_time, db_hwm in rows:
+    for symbol, last_fill_time, db_hwm, loss_limit, stop_floor_price in rows:
         # Fetch high-resolution bars since fill
         url = "https://data.alpaca.markets/v2/stocks/bars"
         params = {

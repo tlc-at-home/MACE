@@ -125,63 +125,104 @@ async def execute_swarm_sweep(args):
     tasks = [process_single_asset_pipeline(symbol, concurrency_semaphore) for symbol in raw_universe]
     brain_signals = await asyncio.gather(*tasks)
 
+
     logger.info("[*] Complete asset matrix evaluated. Processing risk boundaries and execution gates...")
 
+    # Aggregate candidates for portfolio allocator
+    candidates = []
+    for signal in brain_signals:
+        if not signal or signal.get("status") not in ["success", "insufficient_data"]:
+            continue
+        # Map to portfolio allocator expected keys
+        candidates.append({
+            "symbol": signal.get("ticker", "UNKNOWN/USDT"),
+            "current_state": signal.get("regime", "Unknown"),
+            "ml_confirmed": True, # Crypto uses confidence multiplier instead of binary ML confirmation
+            "calculated_kelly": float(signal.get("kelly_fraction", 0.0)),
+            "signal_strength": float(signal.get("signal_strength", 0.0)),
+            "current_price": float(signal.get("current_price", 0.0)),
+            "raw_signal": signal
+        })
+
+    # Get available cash and existing positions
+    conn = sqlite3.connect(DEFAULT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT quantity FROM portfolio WHERE blockchain = 'ARBITRUM' AND token = 'USDT'")
+    cash_row = cursor.fetchone()
+    available_usdt = float(cash_row[0]) if cash_row else 0.0
+    
+    cursor.execute("SELECT token FROM portfolio WHERE token != 'USDT'")
+    existing = [f"{r[0]}/USDT" for r in cursor.fetchall()]
+    conn.close()
+
+    payload = {
+        "candidates": candidates,
+        "available_cash": available_usdt,
+        "existing_positions": existing
+    }
+
+    allocator_path = os.path.join(BASE_DIR, "crypto/swarm/portfolio_allocator.py")
+    allocator_proc = await asyncio.create_subprocess_exec(
+        sys.executable, allocator_path, 
+        stdin=asyncio.subprocess.PIPE, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE
+    )
+    alloc_stdout, alloc_stderr = await allocator_proc.communicate(input=json.dumps(payload).encode())
+    
     top_candidate = None
     best_signal_strength = -1.0
     overall_execution_status = "IDLE"
     max_allocated_dollars = 0.0
-
-    for signal in brain_signals:
-        if not signal or signal.get("status") not in ["success", "insufficient_data"]:
-            continue
-
-        symbol = signal.get("ticker", "UNKNOWN/USDT")
-        regime = signal.get("regime", "Unknown")
-        kelly_fraction = float(signal.get("kelly_fraction", 0.0))
-        signal_strength = float(signal.get("signal_strength", 0.0))
-
-        if signal_strength > best_signal_strength:
-            best_signal_strength = signal_strength
-            top_candidate = {
-                "ticker": symbol,
-                "regime": regime,
-                "calculated_kelly": kelly_fraction,
-                "signal_strength": signal_strength
-            }
-
-        # ==========================================
-        # THE EXIT LOGIC (SELL CONDITION)
-        # ==========================================
-        if regime == "Bear":
-            token_symbol = symbol.split("/")[0]
-            balances = guardrail.get_wallet_balances_summary()
-            held_token = None
-            for chain, chain_data in balances.items():
-                if token_symbol in chain_data.get("tokens", {}):
-                    held_token = chain_data["tokens"][token_symbol]
-                    break
-            if held_token and held_token["quantity"] > 0:
-                current_price = float(signal.get("current_price", held_token["avg_entry_price"]))
-                ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
-                if ledger_receipt.get("success"):
-                    logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
-                    overall_execution_status = "SOLD_BEAR_REGIME"
-                else:
-                    overall_execution_status = "SELL_FAILED"
-
-        # ==========================================
-        # THE ENTRY LOGIC (BUY CONDITION)
-        # ==========================================
-        elif regime == "Bull":
-            brain_output_dump = json.dumps(signal)
-            verdict = guardrail.run_piped_risk_gate(brain_output_dump)
-            if verdict.get("status") == "approved":
-                allocated_dollars = float(verdict.get("allocated_dollars", 0.0))
-                current_price = float(signal.get("current_price", 0.0))
-                if current_price <= 0:
-                    overall_execution_status = "INVALID_PRICE"
-                else:
+    
+    if allocator_proc.returncode != 0:
+        logger.error(f"[-] Portfolio Allocator failed: {alloc_stderr.decode().strip()}")
+    else:
+        alloc_res = json.loads(alloc_stdout.decode().strip())
+        approved_trades = alloc_res.get("approved_trades", [])
+        
+        # Execute sells for Bear regime
+        for cand in candidates:
+            if cand["current_state"] == "Bear" and cand["symbol"] in existing:
+                symbol = cand["symbol"]
+                token_symbol = symbol.split("/")[0]
+                balances = guardrail.get_wallet_balances_summary()
+                held_token = None
+                for chain, chain_data in balances.items():
+                    if token_symbol in chain_data.get("tokens", {}):
+                        held_token = chain_data["tokens"][token_symbol]
+                        break
+                if held_token and held_token["quantity"] > 0:
+                    current_price = cand["current_price"]
+                    ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
+                    if ledger_receipt.get("success"):
+                        logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
+                        overall_execution_status = "SOLD_BEAR_REGIME"
+                    else:
+                        overall_execution_status = "SELL_FAILED"
+        
+        # Execute buys
+        for trade in approved_trades:
+            symbol = trade["symbol"]
+            allocated_dollars = trade.get("target_size_usd", 0.0)
+            current_price = trade.get("current_price", 0.0)
+            
+            if trade.get("signal_strength", 0.0) > best_signal_strength:
+                best_signal_strength = trade.get("signal_strength", 0.0)
+                top_candidate = {
+                    "ticker": symbol,
+                    "regime": trade.get("current_state"),
+                    "calculated_kelly": trade.get("calculated_kelly"),
+                    "signal_strength": best_signal_strength
+                }
+            
+            if current_price <= 0:
+                overall_execution_status = "INVALID_PRICE"
+            else:
+                brain_output_dump = json.dumps(trade["raw_signal"])
+                verdict = guardrail.run_piped_risk_gate(brain_output_dump)
+                if verdict.get("status") == "approved":
+                    allocated_dollars = float(verdict.get("allocated_dollars", 0.0))
                     trade_qty = allocated_dollars / current_price
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="BUY", quantity=trade_qty, execution_price=current_price)
                     if ledger_receipt.get("success"):

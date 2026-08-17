@@ -23,11 +23,11 @@ DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
 def fetch_alpha_stream(symbol, client):
     now_utc = datetime.now(timezone.utc)
-    start_date = (now_utc - timedelta(days=33)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    end_date   = (now_utc - timedelta(days=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_date = (now_utc - timedelta(days=150)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_date   = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     try:
-        bars = client.get_historical_bars(symbol, timeframe="15Min", start=start_date, end=end_date, feed="sip")
+        bars = client.get_historical_bars(symbol, timeframe="1Day", start=start_date, end=end_date, feed="sip")
         if not bars:
             return
 

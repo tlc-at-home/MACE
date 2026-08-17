@@ -120,7 +120,7 @@ async def get_equities_portfolio_context():
     """
     total_equity = 0.0
     available_cash = 0.0
-    existing_positions = []
+    existing_positions = {}
 
     try:
         client = get_client_by_name("alpaca")
@@ -131,8 +131,9 @@ async def get_equities_portfolio_context():
         positions = client.get_positions()
         for pos in positions:
             symbol = pos.get("symbol")
-            if symbol and symbol not in existing_positions:
-                existing_positions.append(symbol)
+            market_value = float(pos.get("market_value", 0.0))
+            if symbol:
+                existing_positions[symbol] = market_value
 
     except Exception as e:
         print(f"[!] Error fetching portfolio context via BrokerClient: {e}")

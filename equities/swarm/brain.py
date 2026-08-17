@@ -4,6 +4,7 @@ import json
 import numpy as np
 import pandas as pd
 from hmmlearn import hmm
+from sklearn.preprocessing import StandardScaler
 
 def run_brain():
     try:
@@ -38,7 +39,7 @@ def run_brain():
 
         # --- YOUR HYBRID MARKOV LOGIC (PRESERVED) ---
         states_map = {'Bear': 0, 'Sideways': 1, 'Bull': 2}
-        conditions = [df['Return_20d'] <= -0.05, df['Return_20d'] >= 0.05]
+        conditions = [df['Return_20d'] <= -0.02, df['Return_20d'] >= 0.02]
         choices = ['Bear', 'Bull']
         df['State'] = np.select(conditions, choices, default='Sideways')
 
@@ -58,7 +59,9 @@ def run_brain():
         signal_strength = prob_bull - prob_bear
 
         # --- HMM CONFIRMATION (FIXED TO 2D) ---
-        X = df[['Daily_Return', 'Volatility_20d']].values
+        X_raw = df[['Daily_Return', 'Volatility_20d']].values
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X_raw)
         hmm_model = hmm.GaussianHMM(n_components=3, covariance_type="diag", n_iter=200, random_state=42)
         hmm_model.fit(X)
         hidden_states = hmm_model.predict(X)

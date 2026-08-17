@@ -67,7 +67,8 @@ def run_portfolio_guardrail():
             if symbol in existing_positions:
                 target_allocation_fraction = min(calculated_kelly, 0.20)
                 target_usd = total_equity * target_allocation_fraction
-                current_val = float(asset.get("current_position_value", target_usd))
+                # Use existing_positions dict which maps symbol to market_value
+                current_val = float(existing_positions[symbol]) if isinstance(existing_positions, dict) else target_usd
 
                 # If position value has surged >15% over target allocation weight, trigger routine profit-taking trim
                 if current_val > (target_usd * 1.15):

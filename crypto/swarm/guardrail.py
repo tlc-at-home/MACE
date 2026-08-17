@@ -354,8 +354,8 @@ def run_piped_risk_gate(brain_output_str):
             total_portfolio_value += (holding["quantity"] * proxy_price)
 
         max_allowed_dollars = total_portfolio_value * MAX_SINGLE_ASSET_EXPOSURE
-        desired_allocation_usd = available_usdt * kelly_f
-        effective_cap = min(desired_allocation_usd, max_allowed_dollars, (available_usdt - MIN_TRADE_SIZE_USD))
+        desired_allocation_usd = total_portfolio_value * kelly_f
+        effective_cap = min(desired_allocation_usd, max_allowed_dollars, available_usdt)
         target_allocation_usd = max(0.0, effective_cap)
 
         if target_allocation_usd < MIN_TRADE_SIZE_USD:

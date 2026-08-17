@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS mcp_execution_log (
     tool_name TEXT NOT NULL,
     arguments TEXT NOT NULL,
     status TEXT NOT NULL,
-    result TEXT
+    result TEXT,
+    error TEXT
 );
 
 -- MCP Requested Trade Queue

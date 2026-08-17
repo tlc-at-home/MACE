@@ -137,12 +137,13 @@ def fetch_tier1_finnhub():
                         change = item.get("change", 0)
                         tx_code = item.get("transactionCode", "").upper()
                         # 'P' = Purchase, positive change = Buy
-                        if tx_code == "P" or change > 0:
+                        if tx_code in ("P", "S") or change != 0:
+                            tx_type_str = "BUY" if (tx_code == "P" or change > 0) else "SELL"
                             candidates.append({
                                 "symbol": sym,
                                 "source": "Finnhub_API",
                                 "politician": item.get("name"),
-                                "transaction_type": "BUY",
+                                "transaction_type": tx_type_str,
                                 "amount_range": f"{item.get('change')} shares @ ${item.get('transactionPrice')}"
                             })
         except Exception as e:
@@ -168,12 +169,13 @@ def fetch_tier2_stock_watcher():
                     for tx in data[:150]:
                         ticker = tx.get("ticker", "").strip().upper()
                         tx_type = str(tx.get("type", "")).upper()
-                        if ticker and "PURCHASE" in tx_type and len(ticker) <= 5 and not ticker.startswith("--") and ticker != "N/A":
+                        if ticker and ("PURCHASE" in tx_type or "SALE" in tx_type) and len(ticker) <= 5 and not ticker.startswith("--") and ticker != "N/A":
+                            tx_type_str = "BUY" if "PURCHASE" in tx_type else "SELL"
                             candidates.append({
                                 "symbol": ticker,
                                 "source": "StockWatcher_PublicData",
                                 "politician": tx.get("representative"),
-                                "transaction_type": "BUY",
+                                "transaction_type": tx_type_str,
                                 "amount_range": tx.get("amount"),
                                 "asset_name": tx.get("asset_description")
                             })
@@ -206,12 +208,13 @@ def fetch_tier3_rapidapi():
                 for item in data.get("trades", [])[:50]:
                     symbol = item.get("ticker", "").strip().upper()
                     tx_type = item.get("type", "").upper()
-                    if symbol and "BUY" in tx_type:
+                    if symbol and ("BUY" in tx_type or "SELL" in tx_type or "SALE" in tx_type):
+                        tx_type_str = "BUY" if "BUY" in tx_type else "SELL"
                         candidates.append({
                             "symbol": symbol,
                             "source": "RapidAPI_PoliticianTracker",
                             "politician": item.get("politician"),
-                            "transaction_type": "BUY",
+                            "transaction_type": tx_type_str,
                             "amount_range": item.get("amount")
                         })
                 logger.info(f"[Tier 3 RapidAPI] Successfully fetched {len(candidates)} candidates.")
@@ -236,12 +239,13 @@ def fetch_tier4_apify_actor():
                 for item in data[:50]:
                     symbol = item.get("issuerTicker", "").strip().upper()
                     tx_type = item.get("txType", "").upper()
-                    if symbol and "BUY" in tx_type:
+                    if symbol and ("BUY" in tx_type or "SELL" in tx_type or "SALE" in tx_type):
+                        tx_type_str = "BUY" if "BUY" in tx_type else "SELL"
                         candidates.append({
                             "symbol": symbol,
                             "source": "Apify_CapitolTrades",
                             "politician": item.get("politicianName"),
-                            "transaction_type": "BUY",
+                            "transaction_type": tx_type_str,
                             "amount_range": item.get("value")
                         })
                 logger.info(f"[Tier 4 Apify] Successfully fetched {len(candidates)} candidates.")
@@ -266,7 +270,8 @@ def fetch_tier5_capitoltrades_html():
                 rows = soup.find_all("tr")
                 for r in rows[:30]:
                     text = r.get_text()
-                    if "buy" in text.lower():
+                    if "buy" in text.lower() or "sell" in text.lower() or "sale" in text.lower():
+                        tx_type_str = "BUY" if "buy" in text.lower() else "SELL"
                         cells = [c.get_text().strip() for c in r.find_all(["td", "th"])]
                         if len(cells) >= 3:
                             symbol = cells[1].upper() if len(cells[1]) <= 6 else ""
@@ -275,7 +280,7 @@ def fetch_tier5_capitoltrades_html():
                                     "symbol": symbol,
                                     "source": "CapitolTrades_WebScraper",
                                     "politician": cells[0],
-                                    "transaction_type": "BUY",
+                                    "transaction_type": tx_type_str,
                                     "amount_range": cells[-1]
                                 })
                 if candidates:
