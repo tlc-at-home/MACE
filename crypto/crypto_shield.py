@@ -11,7 +11,7 @@ import asyncio
 import argparse
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import ccxt
 import paho.mqtt.client as mqtt_client
 
