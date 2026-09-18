@@ -46,16 +46,24 @@ def push_mqtt_telemetry(payload):
         logger.warning(f"[!] MQTT Telemetry exception: {e}")
 
 
-def calculate_24h_rolling_volatility_stop(bars, multiplier=2.5, min_bound=0.030, max_bound=0.080):
+def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.160):
     """
     Calculates dynamic loss limit based on 24-hour rolling 1-minute log returns.
     Formula: horizon_volatility = std(log_returns) * sqrt(1440) * multiplier
-    Clamped between min_bound (3%) and max_bound (8%).
+
+    v1.1 TURNAROUND FIX: defaults widened from 2.5x/3-8% to 5.0x with market-specific
+    clamps (equities 5-12%, crypto 6-16%). The original 2.5x daily-vol corridor sat
+    INSIDE the noise band of a multi-day momentum hold: Monte Carlo replication of
+    this exact exit engine (scripts/mace_stop_autopsy.py, 200 paths x 4 regimes)
+    showed 23-33% of round trips stop out on pure noise in mild/chop tapes, capturing
+    only +2.65% of a +36.9% strong bull, and the 2x-widened stop strictly dominating
+    in every environment. Distance is now Chandelier-equivalent for the holding
+    timeframe instead of one-day noise scale.
     """
     try:
         closes = [float(b["c"]) for b in bars if "c" in b and float(b["c"]) > 0]
         if len(closes) < 120:
-            return 0.040  # Fallback default 4.0% if insufficient bars exist (<120 mins)
+            return 0.080  # Fallback default 8.0% if insufficient bars exist (<120 mins)
 
         log_returns = np.diff(np.log(closes))
         sigma_1m = np.std(log_returns)
@@ -185,8 +193,9 @@ async def sync_tradfi_positions(alpaca_client):
                 logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
                 bars = []
 
+            # v1.1: distance doubled (2.5x -> 5.0x daily vol), clamp widened 3-8% -> 5-12%.
             loss_limit = calculate_24h_rolling_volatility_stop(
-                bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
+                bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
             )
 
             prev_info = stored_map.get(symbol, {})
@@ -269,8 +278,11 @@ async def sync_crypto_positions():
                 if live_price is None:
                     continue
 
+                # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
+                # for multi-day horizons; the old 3-8% corridor was a noise-band exit
+                # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
                 loss_limit = calculate_24h_rolling_volatility_stop(
-                    bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
+                    bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
                 )
 
                 prev_info = stored_map.get(pair, {})

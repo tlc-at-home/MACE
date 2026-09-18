@@ -3,7 +3,7 @@ import json
 import asyncio
 import os
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks, policy
@@ -250,7 +250,7 @@ class MACEPostToolCallHook(hooks.PostToolCallHook):
             except Exception as e:
                 print(f"[!] Failed to lookup trade_id for {symbol}: {e}")
 
-        status_str = "SUCCESS" if not data.error else "FAILED"
+        status_str = "SUCCESS" if (not data.error and "ORDER_REJECTED" not in str(data.result or "")) else "FAILED"
         try:
             with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute("""
@@ -301,6 +301,36 @@ class MACEToolErrorHook(hooks.OnToolErrorHook):
             print(f"[!] Failed to log tool execution exception: {e}")
         return None
 
+def submit_direct_market_order(symbol, notional, side):
+    """v1.1: Submits a notional market order DIRECTLY to the Alpaca paper API.
+    Removes the LLM dispatch layer from order submission - sells previously went
+    through a Gemini prompt referencing a tool (mcp_alpaca_close_position) that was
+    never registered, so every liquidation silently failed."""
+    import requests
+    api_key = os.environ.get("ALPACA_API_KEY")
+    secret_key = os.environ.get("ALPACA_SECRET_KEY")
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": secret_key,
+        "accept": "application/json",
+        "content-type": "application/json"
+    }
+    url = "https://paper-api.alpaca.markets/v2/orders"
+    payload = {
+        "symbol": symbol,
+        "notional": str(notional),
+        "side": side,
+        "type": "market",
+        "time_in_force": "day"
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code < 400 and '"status":"rejected"' not in resp.text.replace(" ", ""):
+            return {"ok": True, "response": resp.text}
+        return {"ok": False, "message": resp.text[:300]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
 async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     """Helper function to handle Gemini MCP Agent execution and retries."""
     if not run_id:
@@ -331,7 +361,11 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
             "time_in_force": time_in_force
         }
         try:
-            resp = requests.post(url, headers=headers, json=payload)
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            # v1.1: surface broker rejections (insufficient buying power, halted
+            # symbols, etc.) so the execution log stops counting them as SUCCESS.
+            if resp.status_code >= 400 or '"status":"rejected"' in resp.text.replace(" ", ""):
+                return f"ORDER_REJECTED: {resp.text[:300]}"
             return resp.text
         except Exception as e:
             return str(e)
@@ -428,6 +462,20 @@ async def run_sweep(args):
     if is_live_execution:
         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         print(f"[*] Starting live execution run: {run_id}")
+
+        # v1.1: expire stale PENDING requests from previous runs (>1h old). A jammed
+        # queue of 3,968 never-resolved rows was observed; stale entries both distort
+        # the trade log and risk surprise-execution if re-dispatched.
+        try:
+            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                cutoff = (datetime.utcnow() - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                conn.execute(
+                    "UPDATE mcp_requested_trades SET status = 'EXPIRED', updated_at = ? WHERE status = 'PENDING' AND updated_at < ?",
+                    (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), cutoff)
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[!] Stale PENDING expiry sweep failed: {e}")
         
         # Log intended trades as 'PENDING'
         try:
@@ -447,18 +495,41 @@ async def run_sweep(args):
             print(f"[!] Failed to log initial trade requests to DB: {e}")
 
         # ==========================================
-        # 1. EXECUTE SELLS FIRST
+        # 1. EXECUTE SELLS FIRST (v1.1: DIRECT BROKER PATH - no LLM dispatch)
+        #    The original prompt told Gemini to call `mcp_alpaca_close_position`, a
+        #    tool that was never registered (only mcp_alpaca_place_stock_order
+        #    exists) - every liquidation silently failed. Sells now execute via the
+        #    same BrokerClient.close_position path the risk shield uses (proven:
+        #    261 shield-driven sell fills vs 0 orchestrator-driven sells in 2 weeks).
         # ==========================================
         if sell_orders:
-            sells_description = "\n".join([f"- {s['symbol']}: {s['reason']}" for s in sell_orders])
-            sell_prompt = (
-                f"You are M.A.C.E. risk manager.\n"
-                f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
-                f"Call the `mcp_alpaca_close_position` tool for each symbol to close the full position."
-            )
-            print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
-            sell_result = await execute_mcp_agent(sell_prompt, "Execute the sell orders now.", run_id)
-            print(f"[+] Sell Order Result: {sell_result}")
+            from brokers import get_client_for_symbol
+            for s in sell_orders:
+                symbol = s["symbol"]
+                action = s.get("action", "SELL")
+                try:
+                    if action == "TRIM_PROFIT_TAKING":
+                        trim_usd = float(s.get("trim_amount_usd", 0.0))
+                        receipt = submit_direct_market_order(symbol, trim_usd, "sell")
+                        ok = receipt.get("ok", False)
+                        print(f"[+] TRIM SELL {symbol} ${trim_usd:.2f}: {'submitted' if ok else 'REJECTED: ' + str(receipt.get('message'))}")
+                    else:
+                        # BEAR_REGIME_LIQUIDATION and any other risk-off sell: full exit
+                        client = get_client_for_symbol(symbol)
+                        await asyncio.to_thread(client.close_position, symbol)
+                        ok = True
+                        print(f"[+] LIQUIDATION SELL {symbol} ({action}): dispatched via BrokerClient.close_position")
+                    try:
+                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                            conn.execute(
+                                "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE run_id = ? AND symbol = ? AND action = 'SELL'",
+                                ("COMPLETED" if ok else "FAILED", datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), run_id, symbol)
+                            )
+                            conn.commit()
+                    except Exception as db_err:
+                        print(f"[!] Sell status DB update failed for {symbol}: {db_err}")
+                except Exception as sell_err:
+                    print(f"[!] DIRECT SELL FAILED for {symbol}: {sell_err}")
 
         # ==========================================
         # 2. EXECUTE BUYS SECOND
@@ -521,8 +592,21 @@ async def run_sweep(args):
             )
             
             if retry_sells:
-                sells_desc = "\n".join([f"- Symbol: '{t[1]}' (Close position)" for t in retry_sells])
-                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `mcp_alpaca_close_position` tool for each symbol."
+                # v1.1: recovery sells go through the direct broker path too
+                from brokers import get_client_for_symbol
+                for t in retry_sells:
+                    try:
+                        client = get_client_for_symbol(t[1])
+                        await asyncio.to_thread(client.close_position, t[1])
+                        print(f"[+] Recovery LIQUIDATION SELL {t[1]} dispatched via BrokerClient.close_position")
+                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                            conn.execute(
+                                "UPDATE mcp_requested_trades SET status = 'COMPLETED', updated_at = ? WHERE trade_id = ?",
+                                (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), t[0])
+                            )
+                            conn.commit()
+                    except Exception as sell_err:
+                        print(f"[!] Recovery sell failed for {t[1]}: {sell_err}")
             
             if retry_buys:
                 buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])

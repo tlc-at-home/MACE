@@ -81,6 +81,24 @@ def get_seconds_until_next_4h_offset():
     delta = target_time - now
     return int(delta.total_seconds())
 
+async def fetch_live_fill_price(pair, fallback_price):
+    """v1.1: fetches live spot for virtual-ledger fills so entries and exits mark
+    off the same feed. Entries previously filled at the brain's stale 4h close while
+    the crypto shield exits at live spot - a systematic ledger P&L distortion."""
+    try:
+        import ccxt
+        exchange = ccxt.kucoin({'enableRateLimit': True})
+        try:
+            ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
+            last = float(ticker['last'])
+            if last and last > 0:
+                return last
+        finally:
+            await exchange.close()
+    except Exception as e:
+        logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
+    return float(fallback_price) if fallback_price else 0.0
+
 async def process_single_asset_pipeline(symbol, semaphore):
     async with semaphore:
         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
@@ -193,7 +211,7 @@ async def execute_swarm_sweep(args):
                         held_token = chain_data["tokens"][token_symbol]
                         break
                 if held_token and held_token["quantity"] > 0:
-                    current_price = cand["current_price"]
+                    current_price = await fetch_live_fill_price(symbol, cand.get("current_price", 0.0))
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
                     if ledger_receipt.get("success"):
                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
@@ -219,6 +237,7 @@ async def execute_swarm_sweep(args):
             if current_price <= 0:
                 overall_execution_status = "INVALID_PRICE"
             else:
+                current_price = await fetch_live_fill_price(symbol, current_price)
                 brain_output_dump = json.dumps(trade["raw_signal"])
                 verdict = guardrail.run_piped_risk_gate(brain_output_dump)
                 if verdict.get("status") == "approved":
