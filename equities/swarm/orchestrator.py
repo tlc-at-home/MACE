@@ -331,6 +331,61 @@ def submit_direct_market_order(symbol, notional, side):
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
+async def execute_direct_buy(run_id, symbol, size_usd):
+    """v1.2: submits a market BUY directly to the Alpaca paper API - the exact
+    same payload the Gemini agent's registered tool posted - then settles
+    mcp_requested_trades and mcp_execution_log truthfully (COMPLETED/FAILED
+    plus an execution-log row with tool_name 'direct_alpaca_buy')."""
+    try:
+        size_usd = float(size_usd or 0.0)
+    except (TypeError, ValueError):
+        size_usd = 0.0
+    if size_usd <= 0:
+        print(f"[!] Direct buy skipped for {symbol}: non-positive size")
+        return False
+
+    receipt = submit_direct_market_order(symbol, size_usd, "buy")
+    ok = bool(receipt.get("ok", False))
+    detail = receipt.get("response") if ok else receipt.get("message")
+    trade_status = "COMPLETED" if ok else "FAILED"
+    if ok:
+        print(f"[+] DIRECT BUY {symbol} ${size_usd:.2f}: submitted to Alpaca paper API")
+    else:
+        print(f"[!] DIRECT BUY {symbol} ${size_usd:.2f} REJECTED: {str(detail)[:200]}")
+
+    now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT trade_id FROM mcp_requested_trades WHERE run_id = ? AND symbol = ? AND action = 'BUY' AND status = 'PENDING'",
+                (run_id, symbol)
+            )
+            row = cursor.fetchone()
+            trade_id = row[0] if row else None
+            if trade_id:
+                cursor.execute(
+                    "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE trade_id = ?",
+                    (trade_status, now_str, trade_id)
+                )
+            conn.execute(
+                "INSERT INTO mcp_execution_log (run_id, trade_id, timestamp, tool_name, arguments, status, result, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    trade_id,
+                    now_str,
+                    "direct_alpaca_buy",
+                    json.dumps({"symbol": symbol, "notional": size_usd, "side": "buy", "type": "market", "time_in_force": "day"}),
+                    "SUCCESS" if ok else "FAILED",
+                    safe_json_dumps(receipt),
+                    None if ok else str(detail)[:500]
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[!] Direct buy DB settlement failed for {symbol}: {e}")
+    return ok
+
 async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     """Helper function to handle Gemini MCP Agent execution and retries."""
     if not run_id:
@@ -462,6 +517,10 @@ async def run_sweep(args):
     if is_live_execution:
         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         print(f"[*] Starting live execution run: {run_id}")
+        # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
+        # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
+        # hatch use only.
+        buy_dispatch_mode = os.environ.get("MACE_BUY_DISPATCH", "direct").strip().lower()
 
         # v1.1: expire stale PENDING requests from previous runs (>1h old). A jammed
         # queue of 3,968 never-resolved rows was observed; stale entries both distort
@@ -532,7 +591,15 @@ async def run_sweep(args):
                     print(f"[!] DIRECT SELL FAILED for {symbol}: {sell_err}")
 
         # ==========================================
-        # 2. EXECUTE BUYS SECOND
+        # 2. EXECUTE BUYS SECOND (v1.2: DIRECT BROKER PATH)
+        #    Buys previously round-tripped through the Gemini Antigravity agent
+        #    (gemini-2.5-flash). That agent has been dead since the API key hit its
+        #    monthly spending cap - every dispatch returned HTTP 429 after 3 retries
+        #    x exponential backoff ("Failed MCP execution"), observed as 167 FAILED
+        #    and 96 EXPIRED buy rows per 48h with only a handful of lucky completions.
+        #    The agent's registered tool posts the IDENTICAL Alpaca REST payload that
+        #    submit_direct_market_order() sends - the LLM layer added no logic, only
+        #    a failure mode. Set MACE_BUY_DISPATCH=agent to restore the legacy path.
         # ==========================================
         if approved_trades:
             top_asset = approved_trades[0]
@@ -547,18 +614,23 @@ async def run_sweep(args):
                 f"- Symbol: '{t['symbol']}', Size: {t['size_usd']} USD"
                 for t in approved_trades
             ])
-            print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
-            buy_prompt = (
-                f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
-                f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
-                f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
-                f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
-                f"TRADES TO EXECUTE:\n{trades_description}\n\n"
-                f"Execute the tools now."
-            )
 
-            print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
-            execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
+            if buy_dispatch_mode == "agent":
+                print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
+                buy_prompt = (
+                    f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
+                    f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
+                    f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
+                    f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
+                    f"TRADES TO EXECUTE:\n{trades_description}\n\n"
+                    f"Execute the tools now."
+                )
+                print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
+                execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
+            else:
+                print(f"[*] Placing REAL market buy orders via direct Alpaca path for:\n{trades_description}...")
+                for t in approved_trades:
+                    await execute_direct_buy(run_id, t["symbol"], float(t["size_usd"]))
 
         # ==========================================
         # 3. RECOVERY LOOP FOR INCOMPLETE TRADES
@@ -586,11 +658,6 @@ async def run_sweep(args):
             retry_sells = [t for t in pending_trades if t[2] == "SELL"]
             retry_buys = [t for t in pending_trades if t[2] == "BUY"]
 
-            recovery_prompt = (
-                f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
-                f"You MUST retry executing only the remaining incomplete orders listed below.\n"
-            )
-            
             if retry_sells:
                 # v1.1: recovery sells go through the direct broker path too
                 from brokers import get_client_for_symbol
@@ -609,14 +676,25 @@ async def run_sweep(args):
                         print(f"[!] Recovery sell failed for {t[1]}: {sell_err}")
             
             if retry_buys:
-                buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
-                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
+                if buy_dispatch_mode == "agent":
+                    buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
+                    recovery_prompt = (
+                        f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
+                        f"You MUST retry executing only the remaining incomplete orders listed below.\n"
+                        f"BUY ORDERS TO RETRY:\n{buys_desc}\n"
+                        f"Call `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol.\n\n"
+                        f"Execute the recovery tool calls now."
+                    )
+                    print(f"[*] Dispatching recovery attempt {attempt} to agent...")
+                    recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
+                    print(f"[+] Recovery execution status: {recovery_status}")
+                else:
+                    # v1.2: recovery buys take the direct broker path too - the Gemini
+                    # agent is 429-dead, so recovery dispatches only burned another
+                    # 3x retry cycle per pass without executing anything.
+                    for t in retry_buys:
+                        await execute_direct_buy(run_id, t[1], float(t[3]) if t[3] else 0.0)
 
-            recovery_prompt += "\n\nExecute the recovery tool calls now."
-            
-            print(f"[*] Dispatching recovery attempt {attempt} to agent...")
-            recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
-            print(f"[+] Recovery execution status: {recovery_status}")
             await asyncio.sleep(5)
 
         # Extract final status summary
