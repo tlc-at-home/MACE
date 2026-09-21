@@ -1,0 +1,454 @@
+diff --git a/crypto/swarm/orchestrator.py b/crypto/swarm/orchestrator.py
+index 6271492..e51b4a8 100755
+--- a/crypto/swarm/orchestrator.py
++++ b/crypto/swarm/orchestrator.py
+@@ -107,6 +107,72 @@ async def fetch_live_fill_price(pair, fallback_price):
+         logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
+     return float(fallback_price) if fallback_price else 0.0
+ 
++# v1.2: re-entry lock applied after a Bear-regime RISK-OFF liquidation. Default 24h
++# = 6 sweeps of the 4h cycle (the regime brain must stay Bull for six consecutive
++# reads before re-entry is possible again). Tunable via MACE_REGIME_COOLDOWN_HOURS.
++REGIME_COOLDOWN_HOURS = float(os.getenv("MACE_REGIME_COOLDOWN_HOURS", "24"))
++
++
++def register_regime_cooldown(symbol):
++    """
++    v1.2: registers a post-RISK-OFF re-entry lock in trade_cooldowns.
++
++    The buy-side guardrail gate (vw_active_cooldowns check inside
++    run_piped_risk_gate) already blocks buys during active cooldowns - it just
++    never received rows from the regime-sell path, which is exactly how BONK
++    churned sell -> rebuy on every regime flip: sold 371M @ 20:08Z, rebought
++    43.8M, sold again 04:07Z, rebought 367.6M - 3 round trips in 36h, each
++    re-entry consuming recovered USDT within the same or next sweep.
++
++    Also mirrors the crypto shield's stop-out path by deleting the pair's
++    crypto_hwm row: a liquidated pair keeps no stale high-water mark (re-entry
++    re-seeds HWM from max(avg_entry, live_price)).
++    """
++    try:
++        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++            cursor = conn.cursor()
++            cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (symbol,))
++            row = cursor.fetchone()
++            if not row:
++                logger.warning(f"[!] Cannot register regime cooldown for {symbol}: no asset_id in vw_crypto_universe")
++                return
++            now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
++            cooldown_until_str = (datetime.utcnow() + timedelta(hours=REGIME_COOLDOWN_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
++            cursor.execute(
++                "INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until) VALUES (?, ?, ?, ?, ?)",
++                (row[0], symbol, now_str, "REGIME_RISK_OFF", cooldown_until_str)
++            )
++            cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (symbol,))
++            conn.commit()
++            logger.info(f"[i] RISK-OFF REBUY PROBATION: {symbol} locked out of re-entry until {cooldown_until_str} ({REGIME_COOLDOWN_HOURS:.0f}h).")
++    except Exception as e:
++        logger.error(f"[!] Regime cooldown registration failed for {symbol}: {e}")
++
++
++def purge_orphan_crypto_hwm_rows():
++    """
++    v1.2: crypto HWM hygiene - deletes crypto_hwm rows for pairs no longer held
++    in the virtual ledger. Pre-v1.2 the RISK-OFF path left rows behind (PAXG
++    3.21%, JST 5.49%, an 8.0% block), pinning stale corridors for unheld pairs
++    on every dashboard read. Mirrors the equities-side HWM hygiene from v1.
++    """
++    try:
++        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++            cursor = conn.cursor()
++            held = cursor.execute("SELECT DISTINCT token FROM portfolio WHERE quantity > 0").fetchall()
++            held_pairs = {f"{r[0]}/USDT" for r in held}
++            if not held_pairs:
++                return  # ledger read empty/unavailable - never wipe on uncertainty
++            rows = cursor.execute("SELECT symbol FROM crypto_hwm").fetchall()
++            orphans = [r[0] for r in rows if r[0] not in held_pairs]
++            if orphans:
++                for sym in orphans:
++                    cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (sym,))
++                conn.commit()
++                logger.info(f"[+] Crypto HWM hygiene: purged {len(orphans)} orphaned row(s): {', '.join(orphans)}")
++    except Exception as e:
++        logger.warning(f"[!] Crypto HWM hygiene sweep failed: {e}")
++
+ async def process_single_asset_pipeline(symbol, semaphore):
+     async with semaphore:
+         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
+@@ -140,6 +206,7 @@ async def execute_swarm_sweep(args):
+     await asyncio.to_thread(push_mqtt_telemetry, start_payload)
+ 
+     guardrail.init_db()
++    purge_orphan_crypto_hwm_rows()  # v1.2: stale-corridor hygiene for unheld pairs
+     raw_universe = load_universe()
+     if args.limit:
+         raw_universe = raw_universe[:args.limit]
+@@ -223,6 +290,7 @@ async def execute_swarm_sweep(args):
+                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
+                     if ledger_receipt.get("success"):
+                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
++                        register_regime_cooldown(symbol)  # v1.2: block same-token rebuy whipsaw
+                         overall_execution_status = "SOLD_BEAR_REGIME"
+                     else:
+                         overall_execution_status = "SELL_FAILED"
+@@ -259,6 +327,11 @@ async def execute_swarm_sweep(args):
+                     else:
+                         logger.warning(f"[-] Ledger transactional entry failure: {ledger_receipt.get('error')}")
+                         overall_execution_status = "REJECTED_BY_LEDGER"
++                else:
++                    # v1.2: surface risk-gate blocks in the journal. Previously these
++                    # were silent, so regime-cooldown rejections were indistinguishable
++                    # from no-ops in telemetry and the BONK whipsaw was invisible.
++                    logger.info(f"[i] RISK GATE: BUY {symbol} blocked - {verdict.get('reason', verdict.get('status', 'unknown'))}")
+ 
+     if not top_candidate:
+         top_candidate = {"ticker": "N/A", "regime": "Neutral", "calculated_kelly": 0.0, "signal_strength": 0.0}
+diff --git a/equities/swarm/orchestrator.py b/equities/swarm/orchestrator.py
+index 8c549c6..b22a3c1 100755
+--- a/equities/swarm/orchestrator.py
++++ b/equities/swarm/orchestrator.py
+@@ -331,6 +331,61 @@ def submit_direct_market_order(symbol, notional, side):
+     except Exception as e:
+         return {"ok": False, "message": str(e)}
+ 
++async def execute_direct_buy(run_id, symbol, size_usd):
++    """v1.2: submits a market BUY directly to the Alpaca paper API - the exact
++    same payload the Gemini agent's registered tool posted - then settles
++    mcp_requested_trades and mcp_execution_log truthfully (COMPLETED/FAILED
++    plus an execution-log row with tool_name 'direct_alpaca_buy')."""
++    try:
++        size_usd = float(size_usd or 0.0)
++    except (TypeError, ValueError):
++        size_usd = 0.0
++    if size_usd <= 0:
++        print(f"[!] Direct buy skipped for {symbol}: non-positive size")
++        return False
++
++    receipt = submit_direct_market_order(symbol, size_usd, "buy")
++    ok = bool(receipt.get("ok", False))
++    detail = receipt.get("response") if ok else receipt.get("message")
++    trade_status = "COMPLETED" if ok else "FAILED"
++    if ok:
++        print(f"[+] DIRECT BUY {symbol} ${size_usd:.2f}: submitted to Alpaca paper API")
++    else:
++        print(f"[!] DIRECT BUY {symbol} ${size_usd:.2f} REJECTED: {str(detail)[:200]}")
++
++    now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
++    try:
++        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++            cursor = conn.cursor()
++            cursor.execute(
++                "SELECT trade_id FROM mcp_requested_trades WHERE run_id = ? AND symbol = ? AND action = 'BUY' AND status = 'PENDING'",
++                (run_id, symbol)
++            )
++            row = cursor.fetchone()
++            trade_id = row[0] if row else None
++            if trade_id:
++                cursor.execute(
++                    "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE trade_id = ?",
++                    (trade_status, now_str, trade_id)
++                )
++            conn.execute(
++                "INSERT INTO mcp_execution_log (run_id, trade_id, timestamp, tool_name, arguments, status, result, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++                (
++                    run_id,
++                    trade_id,
++                    now_str,
++                    "direct_alpaca_buy",
++                    json.dumps({"symbol": symbol, "notional": size_usd, "side": "buy", "type": "market", "time_in_force": "day"}),
++                    "SUCCESS" if ok else "FAILED",
++                    safe_json_dumps(receipt),
++                    None if ok else str(detail)[:500]
++                )
++            )
++            conn.commit()
++    except Exception as e:
++        print(f"[!] Direct buy DB settlement failed for {symbol}: {e}")
++    return ok
++
+ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+     """Helper function to handle Gemini MCP Agent execution and retries."""
+     if not run_id:
+@@ -462,6 +517,10 @@ async def run_sweep(args):
+     if is_live_execution:
+         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+         print(f"[*] Starting live execution run: {run_id}")
++        # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
++        # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
++        # hatch use only.
++        buy_dispatch_mode = os.environ.get("MACE_BUY_DISPATCH", "direct").strip().lower()
+ 
+         # v1.1: expire stale PENDING requests from previous runs (>1h old). A jammed
+         # queue of 3,968 never-resolved rows was observed; stale entries both distort
+@@ -532,7 +591,15 @@ async def run_sweep(args):
+                     print(f"[!] DIRECT SELL FAILED for {symbol}: {sell_err}")
+ 
+         # ==========================================
+-        # 2. EXECUTE BUYS SECOND
++        # 2. EXECUTE BUYS SECOND (v1.2: DIRECT BROKER PATH)
++        #    Buys previously round-tripped through the Gemini Antigravity agent
++        #    (gemini-2.5-flash). That agent has been dead since the API key hit its
++        #    monthly spending cap - every dispatch returned HTTP 429 after 3 retries
++        #    x exponential backoff ("Failed MCP execution"), observed as 167 FAILED
++        #    and 96 EXPIRED buy rows per 48h with only a handful of lucky completions.
++        #    The agent's registered tool posts the IDENTICAL Alpaca REST payload that
++        #    submit_direct_market_order() sends - the LLM layer added no logic, only
++        #    a failure mode. Set MACE_BUY_DISPATCH=agent to restore the legacy path.
+         # ==========================================
+         if approved_trades:
+             top_asset = approved_trades[0]
+@@ -547,18 +614,23 @@ async def run_sweep(args):
+                 f"- Symbol: '{t['symbol']}', Size: {t['size_usd']} USD"
+                 for t in approved_trades
+             ])
+-            print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
+-            buy_prompt = (
+-                f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
+-                f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
+-                f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
+-                f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
+-                f"TRADES TO EXECUTE:\n{trades_description}\n\n"
+-                f"Execute the tools now."
+-            )
+ 
+-            print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
+-            execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
++            if buy_dispatch_mode == "agent":
++                print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
++                buy_prompt = (
++                    f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
++                    f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
++                    f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
++                    f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
++                    f"TRADES TO EXECUTE:\n{trades_description}\n\n"
++                    f"Execute the tools now."
++                )
++                print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
++                execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
++            else:
++                print(f"[*] Placing REAL market buy orders via direct Alpaca path for:\n{trades_description}...")
++                for t in approved_trades:
++                    await execute_direct_buy(run_id, t["symbol"], float(t["size_usd"]))
+ 
+         # ==========================================
+         # 3. RECOVERY LOOP FOR INCOMPLETE TRADES
+@@ -586,11 +658,6 @@ async def run_sweep(args):
+             retry_sells = [t for t in pending_trades if t[2] == "SELL"]
+             retry_buys = [t for t in pending_trades if t[2] == "BUY"]
+ 
+-            recovery_prompt = (
+-                f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
+-                f"You MUST retry executing only the remaining incomplete orders listed below.\n"
+-            )
+-            
+             if retry_sells:
+                 # v1.1: recovery sells go through the direct broker path too
+                 from brokers import get_client_for_symbol
+@@ -609,14 +676,25 @@ async def run_sweep(args):
+                         print(f"[!] Recovery sell failed for {t[1]}: {sell_err}")
+             
+             if retry_buys:
+-                buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
+-                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
++                if buy_dispatch_mode == "agent":
++                    buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
++                    recovery_prompt = (
++                        f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
++                        f"You MUST retry executing only the remaining incomplete orders listed below.\n"
++                        f"BUY ORDERS TO RETRY:\n{buys_desc}\n"
++                        f"Call `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol.\n\n"
++                        f"Execute the recovery tool calls now."
++                    )
++                    print(f"[*] Dispatching recovery attempt {attempt} to agent...")
++                    recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
++                    print(f"[+] Recovery execution status: {recovery_status}")
++                else:
++                    # v1.2: recovery buys take the direct broker path too - the Gemini
++                    # agent is 429-dead, so recovery dispatches only burned another
++                    # 3x retry cycle per pass without executing anything.
++                    for t in retry_buys:
++                        await execute_direct_buy(run_id, t[1], float(t[3]) if t[3] else 0.0)
+ 
+-            recovery_prompt += "\n\nExecute the recovery tool calls now."
+-            
+-            print(f"[*] Dispatching recovery attempt {attempt} to agent...")
+-            recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
+-            print(f"[+] Recovery execution status: {recovery_status}")
+             await asyncio.sleep(5)
+ 
+         # Extract final status summary
+diff --git a/hwm_stop_updater.py b/hwm_stop_updater.py
+index 7d7c7fa..1a21977 100755
+--- a/hwm_stop_updater.py
++++ b/hwm_stop_updater.py
+@@ -78,6 +78,56 @@ def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050,
+         return min_bound
+ 
+ 
++def calculate_daily_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.120, min_daily_bars=10):
++    """
++    v1.2: equities stop distance from DAILY closes (14-20 calendar day window).
++
++    The intraday 24h/1Min basis starved on weekends and pre-open Mondays
++    (IEX returned <120 1-min bars), which pinned every equity corridor at
++    exactly the static 8.0% fallback for the whole 48h post-deploy window
++    (all 17 held symbols at 8.00%). Daily closes are weekend-immune and
++    express the same "5x daily vol" distance the 5-12% clamp band was sized
++    for (sigma_1m * sqrt(1440) == sigma_daily), restoring per-symbol scaling.
++
++    Returns None when daily history is insufficient or degenerate, so the
++    caller can fall back to the intraday calculation - "no data" stays
++    distinguishable from a genuinely computed corridor.
++    """
++    try:
++        closes = [float(b["c"]) for b in bars if "c" in b and float(b["c"]) > 0]
++        if len(closes) < min_daily_bars:
++            return None
++
++        log_returns = np.diff(np.log(closes))
++        sigma_daily = float(np.std(log_returns))
++        if sigma_daily <= 0.0 or not np.isfinite(sigma_daily):
++            return None
++
++        horizon_volatility = sigma_daily * multiplier
++        return max(min_bound, min(horizon_volatility, max_bound))
++    except Exception as e:
++        logger.warning(f"[!] Exception calculating daily volatility stop: {e}")
++        return None
++
++
++_LAST_VOL_BASIS = {}
++
++
++def note_vol_basis_change(symbol, vol_basis, loss_limit):
++    """
++    v1.2: logs stop-distance basis TRANSITIONS only. The updater daemon sweeps
++    every 60s; per-sweep logging would add ~25k journal lines/day. Transition-only
++    logging keeps the journal quiet while every corridor flip (daily <-> fallback)
++    remains visible for dashboard verification.
++    """
++    try:
++        if _LAST_VOL_BASIS.get(symbol) != vol_basis:
++            _LAST_VOL_BASIS[symbol] = vol_basis
++            logger.info(f"[i] {symbol}: stop-distance basis -> {vol_basis} (corridor {loss_limit * 100:.2f}%)")
++    except Exception:
++        pass
++
++
+ def get_db_connection():
+     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+@@ -179,24 +229,53 @@ async def sync_tradfi_positions(alpaca_client):
+ 
+             asset_id = get_or_create_asset_id(conn, symbol, asset_class="TRADFI", broker="alpaca")
+ 
+-            # Request 1,440 1-minute bars for 24h volatility profile (using IEX feed for paper accounts)
++            # v1.2: PRIMARY vol basis = 20 calendar days of daily bars. The 24h/1Min
++            # IEX window starved on weekends and pre-open Mondays (<120 bars), which
++            # pinned every equity at the static 8.0% fallback (48h post-deploy: all 17
++            # corridors at exactly 8.0%). Daily closes are weekend-immune and match the
++            # 5x-daily-vol basis the 5-12% clamp band was sized for.
++            vol_basis = "fallback_8pct"
++            loss_limit = None
+             try:
+-                bars = await asyncio.to_thread(
++                daily_start_str = (now_utc - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
++                daily_bars = await asyncio.to_thread(
+                     alpaca_client.get_historical_bars,
+                     symbol,
+-                    "1Min",
+-                    start_str,
++                    "1Day",
++                    daily_start_str,
+                     end_str,
+                     "iex"
+                 )
++                loss_limit = calculate_daily_volatility_stop(
++                    daily_bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
++                )
++                if loss_limit is not None:
++                    vol_basis = "daily_20d"
+             except Exception as e:
+-                logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
+-                bars = []
++                logger.warning(f"[!] Failed fetching daily bars for {symbol}: {e}")
+ 
+-            # v1.1: distance doubled (2.5x -> 5.0x daily vol), clamp widened 3-8% -> 5-12%.
+-            loss_limit = calculate_24h_rolling_volatility_stop(
+-                bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
+-            )
++            # Fallback chain: 24h of 1-minute bars (recent listings / daily feed outage)
++            if loss_limit is None:
++                try:
++                    bars = await asyncio.to_thread(
++                        alpaca_client.get_historical_bars,
++                        symbol,
++                        "1Min",
++                        start_str,
++                        end_str,
++                        "iex"
++                    )
++                except Exception as e:
++                    logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
++                    bars = []
++                if len(bars) >= 120:
++                    vol_basis = "intraday_24h"
++                # v1.1: distance doubled (2.5x -> 5.0x daily vol), clamp widened 3-8% -> 5-12%.
++                loss_limit = calculate_24h_rolling_volatility_stop(
++                    bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
++                )
++
++            note_vol_basis_change(symbol, vol_basis, loss_limit)
+ 
+             prev_info = stored_map.get(symbol, {})
+             prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+@@ -215,7 +294,8 @@ async def sync_tradfi_positions(alpaca_client):
+                 "live_price": live_price,
+                 "hwm": new_hwm,
+                 "loss_limit_pct": round(loss_limit * 100, 2),
+-                "floor_price": round(floor_price, 2)
++                "floor_price": round(floor_price, 2),
++                "vol_basis": vol_basis
+             })
+ 
+     return summary
+@@ -278,12 +358,16 @@ async def sync_crypto_positions():
+                 if live_price is None:
+                     continue
+ 
++                # v1.2: track basis for crypto too (1m bars normally return 1440)
++                vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
++
+                 # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
+                 # for multi-day horizons; the old 3-8% corridor was a noise-band exit
+                 # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
+                 loss_limit = calculate_24h_rolling_volatility_stop(
+                     bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
+                 )
++                note_vol_basis_change(pair, vol_basis, loss_limit)
+ 
+                 prev_info = stored_map.get(pair, {})
+                 prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+@@ -299,7 +383,8 @@ async def sync_crypto_positions():
+                     "live_price": live_price,
+                     "hwm": new_hwm,
+                     "loss_limit_pct": round(loss_limit * 100, 2),
+-                    "floor_price": round(floor_price, 2)
++                    "floor_price": round(floor_price, 2),
++                    "vol_basis": vol_basis
+                 })
+ 
+         await primary_exchange.close()
+@@ -320,7 +405,11 @@ async def run_update_sweep():
+ 
+     combined_positions = tradfi_summary + crypto_summary
+     total_active = len(combined_positions)
+-    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active} (TradFi: {len(tradfi_summary)}, Crypto: {len(crypto_summary)})")
++    basis_counts = {}
++    for p in combined_positions:
++        b = p.get("vol_basis", "unknown")
++        basis_counts[b] = basis_counts.get(b, 0) + 1
++    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active} (TradFi: {len(tradfi_summary)}, Crypto: {len(crypto_summary)}). Vol basis: {basis_counts}")
+ 
+     push_mqtt_telemetry({
+         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

@@ -107,72 +107,6 @@ async def fetch_live_fill_price(pair, fallback_price):
         logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
     return float(fallback_price) if fallback_price else 0.0
 
-# v1.2: re-entry lock applied after a Bear-regime RISK-OFF liquidation. Default 24h
-# = 6 sweeps of the 4h cycle (the regime brain must stay Bull for six consecutive
-# reads before re-entry is possible again). Tunable via MACE_REGIME_COOLDOWN_HOURS.
-REGIME_COOLDOWN_HOURS = float(os.getenv("MACE_REGIME_COOLDOWN_HOURS", "24"))
-
-
-def register_regime_cooldown(symbol):
-    """
-    v1.2: registers a post-RISK-OFF re-entry lock in trade_cooldowns.
-
-    The buy-side guardrail gate (vw_active_cooldowns check inside
-    run_piped_risk_gate) already blocks buys during active cooldowns - it just
-    never received rows from the regime-sell path, which is exactly how BONK
-    churned sell -> rebuy on every regime flip: sold 371M @ 20:08Z, rebought
-    43.8M, sold again 04:07Z, rebought 367.6M - 3 round trips in 36h, each
-    re-entry consuming recovered USDT within the same or next sweep.
-
-    Also mirrors the crypto shield's stop-out path by deleting the pair's
-    crypto_hwm row: a liquidated pair keeps no stale high-water mark (re-entry
-    re-seeds HWM from max(avg_entry, live_price)).
-    """
-    try:
-        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (symbol,))
-            row = cursor.fetchone()
-            if not row:
-                logger.warning(f"[!] Cannot register regime cooldown for {symbol}: no asset_id in vw_crypto_universe")
-                return
-            now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            cooldown_until_str = (datetime.utcnow() + timedelta(hours=REGIME_COOLDOWN_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            cursor.execute(
-                "INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until) VALUES (?, ?, ?, ?, ?)",
-                (row[0], symbol, now_str, "REGIME_RISK_OFF", cooldown_until_str)
-            )
-            cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (symbol,))
-            conn.commit()
-            logger.info(f"[i] RISK-OFF REBUY PROBATION: {symbol} locked out of re-entry until {cooldown_until_str} ({REGIME_COOLDOWN_HOURS:.0f}h).")
-    except Exception as e:
-        logger.error(f"[!] Regime cooldown registration failed for {symbol}: {e}")
-
-
-def purge_orphan_crypto_hwm_rows():
-    """
-    v1.2: crypto HWM hygiene - deletes crypto_hwm rows for pairs no longer held
-    in the virtual ledger. Pre-v1.2 the RISK-OFF path left rows behind (PAXG
-    3.21%, JST 5.49%, an 8.0% block), pinning stale corridors for unheld pairs
-    on every dashboard read. Mirrors the equities-side HWM hygiene from v1.
-    """
-    try:
-        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            held = cursor.execute("SELECT DISTINCT token FROM portfolio WHERE quantity > 0").fetchall()
-            held_pairs = {f"{r[0]}/USDT" for r in held}
-            if not held_pairs:
-                return  # ledger read empty/unavailable - never wipe on uncertainty
-            rows = cursor.execute("SELECT symbol FROM crypto_hwm").fetchall()
-            orphans = [r[0] for r in rows if r[0] not in held_pairs]
-            if orphans:
-                for sym in orphans:
-                    cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (sym,))
-                conn.commit()
-                logger.info(f"[+] Crypto HWM hygiene: purged {len(orphans)} orphaned row(s): {', '.join(orphans)}")
-    except Exception as e:
-        logger.warning(f"[!] Crypto HWM hygiene sweep failed: {e}")
-
 async def process_single_asset_pipeline(symbol, semaphore):
     async with semaphore:
         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
@@ -206,7 +140,6 @@ async def execute_swarm_sweep(args):
     await asyncio.to_thread(push_mqtt_telemetry, start_payload)
 
     guardrail.init_db()
-    purge_orphan_crypto_hwm_rows()  # v1.2: stale-corridor hygiene for unheld pairs
     raw_universe = load_universe()
     if args.limit:
         raw_universe = raw_universe[:args.limit]
@@ -290,7 +223,6 @@ async def execute_swarm_sweep(args):
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
                     if ledger_receipt.get("success"):
                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
-                        register_regime_cooldown(symbol)  # v1.2: block same-token rebuy whipsaw
                         overall_execution_status = "SOLD_BEAR_REGIME"
                     else:
                         overall_execution_status = "SELL_FAILED"
@@ -327,11 +259,6 @@ async def execute_swarm_sweep(args):
                     else:
                         logger.warning(f"[-] Ledger transactional entry failure: {ledger_receipt.get('error')}")
                         overall_execution_status = "REJECTED_BY_LEDGER"
-                else:
-                    # v1.2: surface risk-gate blocks in the journal. Previously these
-                    # were silent, so regime-cooldown rejections were indistinguishable
-                    # from no-ops in telemetry and the BONK whipsaw was invisible.
-                    logger.info(f"[i] RISK GATE: BUY {symbol} blocked - {verdict.get('reason', verdict.get('status', 'unknown'))}")
 
     if not top_candidate:
         top_candidate = {"ticker": "N/A", "regime": "Neutral", "calculated_kelly": 0.0, "signal_strength": 0.0}
