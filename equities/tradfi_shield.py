@@ -128,6 +128,19 @@ class TradFiShield:
                             logger.error(f"[!] {symbol}: cooldown/HWM registration failed ({cd_err}). Dispatching liquidation regardless.")
 
                         # 2) Dispatch the liquidation via the direct BrokerClient path.
+                        # v1.3: record the realized round trip first (entry basis =
+                        # Alpaca avg_entry_price, exit = live price at dispatch,
+                        # flagged dispatch_approx) so honest Kelly stats include
+                        # stop-out outcomes. Never blocks the liquidation itself.
+                        try:
+                            import realized_round_trips as _rrt
+                            _rrt.record_trip(
+                                asset_class="TRADFI", symbol=symbol, qty=qty,
+                                entry_price=avg_entry, exit_price=live_price,
+                                reason="STOP_LOSS_BREACH", basis="dispatch_approx",
+                                db_path=DEFAULT_DB_PATH)
+                        except Exception:
+                            pass
                         logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
                         await asyncio.to_thread(symbol_client.close_position, symbol)
 

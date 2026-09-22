@@ -23,7 +23,10 @@ async def fetch_market_data(symbol, timeframe='4h', limit=540):
 
         payload = {
             "symbol": symbol,
-            "prices": close_prices
+            "prices": close_prices,
+            # v1.3: brain needs the bar interval to annualize its Sharpe proxy
+            # correctly (sqrt(365) on 4h bars understated it by sqrt(6) = 2.45x).
+            "timeframe": timeframe
         }
         print(json.dumps(payload))
 

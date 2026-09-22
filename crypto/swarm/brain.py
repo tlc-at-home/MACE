@@ -14,8 +14,26 @@ import sys
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 import json
+import os
 import numpy as np
 import pandas as pd
+
+# v1.3: shared empirical-Kelly helpers live at the repo root (pure stdlib -
+# keeps the brain subprocess free of DB/sqlite imports; stats arrive via env).
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+from realized_round_trips import parse_empirical_env, blend_with_prior
+
+# v1.3: annualization factors per bar interval. The old code hardcoded
+# sqrt(365) (daily bars) while the scout feeds 4h candles - the Sharpe proxy
+# was understated by exactly sqrt(6) = 2.449x, suppressing the confidence
+# multiplier that scales Kelly sizing.
+_PERIODS_PER_YEAR = {
+    "1m": 525600, "5m": 105120, "15m": 35040, "30m": 17520,
+    "1h": 8760, "2h": 4380, "4h": 2190, "6h": 1460, "8h": 1095,
+    "12h": 730, "1d": 365,
+}
 from hmmlearn.hmm import GaussianHMM
 
 def compute_quantitative_signals(raw_input):
@@ -32,6 +50,7 @@ def compute_quantitative_signals(raw_input):
     # FIX: Read 'symbol' and 'prices' to match scout.py output contract
     ticker = payload.get("symbol", "UNKNOWN/USDT")
     prices = payload.get("prices", [])
+    timeframe = str(payload.get("timeframe", "4h"))
 
     if not prices:
         return {"status": "error", "message": "Brain received empty or missing prices payload."}
@@ -92,6 +111,18 @@ def compute_quantitative_signals(raw_input):
         base_win_loss_ratio = 1.00
 
     # 6. Quant Fix: Dynamic Fractional Kelly Sizing
+    # v1.3: replace the hardcoded 'backtested' priors with a shrinkage blend
+    # against realized round trips (MACE_EMPIRICAL_KELLY_JSON is set per sweep
+    # by the orchestrator once n >= MACE_KELLY_MIN_ROUNDS realized exits
+    # exist). Until then the priors remain in force - no behavioral cliff.
+    empirical = parse_empirical_env()
+    if empirical is not None:
+        base_win_rate, base_win_loss_ratio = blend_with_prior(
+            empirical, base_win_rate, base_win_loss_ratio,
+            k=empirical.get("prior_strength", 20))
+        kelly_basis = f"empirical n={empirical['n']} wr={base_win_rate:.3f} po={base_win_loss_ratio:.2f}"
+    else:
+        kelly_basis = "prior"
     loss_rate = 1.0 - base_win_rate
     theoretical_kelly = base_win_rate - (loss_rate / base_win_loss_ratio)
 
@@ -102,7 +133,8 @@ def compute_quantitative_signals(raw_input):
 
     signal_strength = 0.0
     if returns_std > 0:
-        signal_strength = float((recent_returns.mean() / returns_std) * np.sqrt(365))
+        periods = _PERIODS_PER_YEAR.get(timeframe, 2190)
+        signal_strength = float((recent_returns.mean() / returns_std) * np.sqrt(periods))
 
     # FIX: Floor confidence at 0.0 (not 0.2) so losing assets get zero allocation
     confidence_multiplier = np.clip(signal_strength, 0.0, 1.0)
@@ -119,7 +151,9 @@ def compute_quantitative_signals(raw_input):
         "current_price": float(df['close'].iloc[-1]), # Added for downstream execution
         "regime": regime,
         "kelly_fraction": round(sanitized_kelly, 4),
-        "signal_strength": round(signal_strength, 4)
+        "signal_strength": round(signal_strength, 4),
+        "kelly_basis": kelly_basis,  # v1.3: journal/telemetry transparency
+        "bar_timeframe": timeframe
     }
 
 if __name__ == "__main__":

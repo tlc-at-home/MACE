@@ -44,6 +44,9 @@ if BASE_DIR not in sys.path:
 
 from brokers import get_client_by_name
 
+# v1.3: shared health/round-trip store at repo root (BASE_DIR already on sys.path).
+import realized_round_trips as rrt
+
 # MQTT Broker config
 MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -467,6 +470,31 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     except Exception as e:
         return f"Failed MCP execution: {str(e)}"
 
+def record_equity_sell_trip(symbol, reason, trim_usd=None):
+    """v1.3: records a realized (approximate) round trip for an equities exit.
+    Entry basis and position size come from the live Alpaca position snapshot;
+    exit is the position's current_price at dispatch time (flagged
+    dispatch_approx - market-order fills can slip from it). Never raises."""
+    try:
+        from brokers import get_client_for_symbol
+        client = get_client_for_symbol(symbol)
+        pos = client.get_position(symbol)
+        if not pos:
+            return
+        qty = float(pos.get("qty", 0.0))
+        avg_entry = float(pos.get("avg_entry_price", 0.0))
+        exit_ref = float(pos.get("current_price", 0.0))
+        if qty <= 0 or avg_entry <= 0 or exit_ref <= 0:
+            return
+        if trim_usd is not None:
+            qty = min(qty, trim_usd / exit_ref)
+        rrt.record_trip(
+            asset_class="TRADFI", symbol=symbol, qty=qty,
+            entry_price=avg_entry, exit_price=exit_ref,
+            reason=reason, basis="dispatch_approx", db_path=DEFAULT_DB_PATH)
+    except Exception:
+        pass
+
 async def run_sweep(args):
     symbols = []
     sources = {}
@@ -477,6 +505,18 @@ async def run_sweep(args):
         symbols, sources = load_tradfi_universe(DEFAULT_DB_PATH, args.limit)
 
     print(f"[*] Starting async scanning of {len(symbols)} equities assets...")
+
+    # v1.3 fix 3: hand realized edge stats to the brain subprocesses via env
+    # (scout stdout still pipes into brain stdin unchanged; env is the only
+    # side channel that preserves that contract). None -> priors stay in force.
+    rrt.ensure_schema(DEFAULT_DB_PATH)
+    empirical = rrt.empirical_env_json("TRADFI", db_path=DEFAULT_DB_PATH)
+    if empirical:
+        os.environ["MACE_EMPIRICAL_KELLY_JSON"] = empirical
+        print(f"[i] Empirical Kelly stats active: {empirical}")
+    else:
+        os.environ.pop("MACE_EMPIRICAL_KELLY_JSON", None)
+
 
     sem = asyncio.Semaphore(3)
     tasks = [sem_pipeline(symbol, sources.get(symbol, "static"), sem) for symbol in symbols]
@@ -517,6 +557,23 @@ async def run_sweep(args):
     if is_live_execution:
         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         print(f"[*] Starting live execution run: {run_id}")
+
+        # v1.3 fix 1: FAIL-NEUTRAL news-guard gate. The guard (sole remaining
+        # Gemini consumer, 4h cadence) is blind while its API key sits at the
+        # 429 monthly cap; pre-v1.3 the system silently proceeded as if every
+        # audit had come back clean (fail-open). Neutral posture: NEW entries
+        # are held until a fresh healthy audit lands; sells, trims, stop-outs
+        # and liquidations remain fully live (no gross risk added, existing
+        # risk fully managed). MACE_NEWS_GATE=off restores legacy fail-open.
+        if approved_trades:
+            gate_ok, gate_detail = rrt.news_gate_allows_buys(DEFAULT_DB_PATH)
+            if not gate_ok:
+                print(f"[i] NEWS GUARD FAIL-NEUTRAL: holding {len(approved_trades)} new buy(s) "
+                      f"- {gate_detail}. Sells and risk-off remain live. "
+                      f"Set MACE_NEWS_GATE=off to override.")
+                approved_trades = []
+                execution_status = "FAIL_NEUTRAL_NEWS_GUARD: " + gate_detail
+
         # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
         # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
         # hatch use only.
@@ -569,11 +626,13 @@ async def run_sweep(args):
                 try:
                     if action == "TRIM_PROFIT_TAKING":
                         trim_usd = float(s.get("trim_amount_usd", 0.0))
+                        record_equity_sell_trip(symbol, "TRIM_PROFIT_TAKING", trim_usd=trim_usd)  # v1.3
                         receipt = submit_direct_market_order(symbol, trim_usd, "sell")
                         ok = receipt.get("ok", False)
                         print(f"[+] TRIM SELL {symbol} ${trim_usd:.2f}: {'submitted' if ok else 'REJECTED: ' + str(receipt.get('message'))}")
                     else:
                         # BEAR_REGIME_LIQUIDATION and any other risk-off sell: full exit
+                        record_equity_sell_trip(symbol, action)  # v1.3
                         client = get_client_for_symbol(symbol)
                         await asyncio.to_thread(client.close_position, symbol)
                         ok = True
@@ -663,6 +722,7 @@ async def run_sweep(args):
                 from brokers import get_client_for_symbol
                 for t in retry_sells:
                     try:
+                        record_equity_sell_trip(t[1], "RECOVERY_SELL")  # v1.3
                         client = get_client_for_symbol(t[1])
                         await asyncio.to_thread(client.close_position, t[1])
                         print(f"[+] Recovery LIQUIDATION SELL {t[1]} dispatched via BrokerClient.close_position")

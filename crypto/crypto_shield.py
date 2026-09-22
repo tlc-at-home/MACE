@@ -19,6 +19,16 @@ import paho.mqtt.client as mqtt_client
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
+# v1.3: shared modules at repo root - realized round-trip store (honest Kelly)
+# and the same taker fee the guardrail virtual ledger now charges. The shield
+# settles stop-outs via raw SQL that bypasses guardrail, so it must apply the
+# fee itself or exits would be gross while entries (post-v1.3) are fee-inclusive.
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+import realized_round_trips as rrt
+
+TAKER_FEE = float(os.getenv("MACE_TAKER_FEE", "0.001"))
+
 # MQTT Config
 MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -158,11 +168,25 @@ class CryptoShield:
                 if trailing_drawdown_pct <= -loss_limit:
                     logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
 
-                    usdt_recovered = qty * live_price
+                    # v1.3: net of taker fee - entries have been fee-inclusive
+                    # in the guardrail since v1.3; a gross exit credit would
+                    # systematically overstate recovered USDT by 0.1% per stop-out.
+                    usdt_recovered = qty * live_price * (1.0 - TAKER_FEE)
+                    fee_charged = qty * live_price * TAKER_FEE
                     if live_price < 0.01:
-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT")
+                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
                     else:
-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
+                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
+
+                    # v1.3: register the realized round trip (ledger-exact: entry
+                    # basis = ledger avg_entry_price, exit = live net of fee) so
+                    # the brains' Kelly stats reflect stop-out outcomes.
+                    rrt.record_trip(
+                        asset_class="CRYPTO", symbol=pair, qty=qty,
+                        entry_price=cost_basis,
+                        exit_price=live_price * (1.0 - TAKER_FEE),
+                        reason="STOP_LOSS_BREACH", basis="ledger_exact",
+                        db_path=DEFAULT_DB_PATH)
 
                     # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
                     cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))

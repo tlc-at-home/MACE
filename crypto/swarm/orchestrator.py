@@ -20,6 +20,13 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 sys.path.append(os.path.join(BASE_DIR, "crypto/swarm"))
 import guardrail
 
+# v1.3: shared repo-root modules - multi-venue live prices (fix 5) and the
+# realized round-trip store (fix 3, honest Kelly stats).
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+import price_venues
+import realized_round_trips as rrt
+
 MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "mace/telemetry/crypto_sword"
@@ -82,30 +89,23 @@ def get_seconds_until_next_4h_offset():
     return int(delta.total_seconds())
 
 async def fetch_live_fill_price(pair, fallback_price):
-    """v1.1: fetches live spot for virtual-ledger fills so entries and exits mark
-    off the same feed. Entries previously filled at the brain's stale 4h close while
-    the crypto shield exits at live spot - a systematic ledger P&L distortion."""
+    """v1.3: ledger fills now price off a venue POOL (default KuCoin -> Binance
+    -> Bybit, MACE_PRICE_VENUES) mirroring the crypto shield's proven failover.
+    v1.1 fetched live spot so entries/exits mark off one feed; v1.1.1 fixed the
+    sync close() clobber; v1.3 removes the single-venue failure mode that
+    silently reverted fills to the brain's stale 4h closes."""
     try:
-        import ccxt
-        exchange = ccxt.kucoin({'enableRateLimit': True})
-        try:
-            ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
-            last = float(ticker['last'])
-            if last and last > 0:
-                return last
-        finally:
-            # v1.1.1 hotfix: sync ccxt close() returns None (not awaitable) - awaiting it
-            # raised TypeError in the finally block, clobbering the return value and
-            # forcing 100% of live-price fetches to fall back to stale brain prices.
-            try:
-                maybe = exchange.close()
-                if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
-                    await maybe
-            except Exception:
-                pass
+        price, venue = await price_venues.fetch_live_price_pool(
+            pair, fallback_price=fallback_price, log=logger.info)
+        if venue is not None:
+            return price
+        if fallback_price:
+            logger.warning(f"[!] Live fill price fetch failed for {pair} on all venues; using brain price.")
+            return float(fallback_price)
+        return 0.0
     except Exception as e:
         logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
-    return float(fallback_price) if fallback_price else 0.0
+        return float(fallback_price) if fallback_price else 0.0
 
 # v1.2: re-entry lock applied after a Bear-regime RISK-OFF liquidation. Default 24h
 # = 6 sweeps of the 4h cycle (the regime brain must stay Bull for six consecutive
@@ -173,6 +173,73 @@ def purge_orphan_crypto_hwm_rows():
     except Exception as e:
         logger.warning(f"[!] Crypto HWM hygiene sweep failed: {e}")
 
+
+# v1.3 fix 6: stale-ledger write-down state. Tokens that cannot price on ANY
+# configured venue for MACE_STALE_LEDGER_SWEEPS consecutive sweeps get their
+# ledger row written down (deleted, exit=0 round trip) instead of silently
+# inflating total_portfolio_value via stale avg-entry proxy pricing (BEAT/USDT
+# sat at ~$989 unpriceable on both KuCoin and Binance since Sept).
+_LEDGER_PRICE_FAILS = {}
+STALE_LEDGER_SWEEPS = int(os.getenv("MACE_STALE_LEDGER_SWEEPS", "3"))
+
+
+async def purge_unpriceable_ledger_rows():
+    """
+    v1.3: removes virtual-ledger rows that no venue can price anymore.
+
+    Canary guard: when >= half of held tokens are unpriceable in the SAME
+    sweep, the purge is skipped entirely - that signature is a venue/network
+    outage, not N simultaneous delistings. Fail counts reset on any successful
+    price read, and daemon restart resets patience (harmless: 3 sweeps = 12h).
+    """
+    try:
+        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+            rows = conn.execute(
+                "SELECT token, quantity, avg_entry_price FROM portfolio WHERE token != 'USDT' AND quantity > 0"
+            ).fetchall()
+        if not rows:
+            return
+
+        priced, unpriced = [], []
+        for token, qty, avg_entry in rows:
+            pair = f"{token}/USDT"
+            ok = await price_venues.price_available_anywhere(pair)
+            if ok:
+                _LEDGER_PRICE_FAILS.pop(token, None)
+                priced.append(token)
+            else:
+                _LEDGER_PRICE_FAILS[token] = _LEDGER_PRICE_FAILS.get(token, 0) + 1
+                unpriced.append((token, qty, avg_entry))
+
+        # Outage canary: never mass-purge on a suspected network/venue outage.
+        if unpriced and len(unpriced) >= max(2, (len(rows) + 1) // 2):
+            logger.warning(
+                f"[i] Stale-ledger purge skipped: {len(unpriced)}/{len(rows)} tokens unpriceable "
+                f"(suspected venue/network outage, not delisting)")
+            return
+
+        for token, qty, avg_entry in unpriced:
+            fails = _LEDGER_PRICE_FAILS.get(token, 0)
+            if fails < STALE_LEDGER_SWEEPS:
+                logger.info(
+                    f"[i] {token}/USDT unpriceable ({fails}/{STALE_LEDGER_SWEEPS} sweeps); "
+                    f"write-down deferred pending confirmation")
+                continue
+            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                conn.execute("DELETE FROM portfolio WHERE token = ?", (token,))
+                conn.commit()
+            rrt.record_trip(
+                asset_class="CRYPTO", symbol=f"{token}/USDT", qty=float(qty),
+                entry_price=float(avg_entry), exit_price=0.0,
+                reason="STALE_LEDGER_WRITE_DOWN", basis="ledger_exact",
+                db_path=DEFAULT_DB_PATH)
+            logger.warning(
+                f"[!] STALE LEDGER WRITE-DOWN: {token} removed from virtual ledger "
+                f"(unpriceable across all venues for {fails} sweeps, cost basis "
+                f"${float(qty) * float(avg_entry):.2f} written off)")
+    except Exception as e:
+        logger.warning(f"[!] Stale-ledger purge sweep failed: {e}")
+
 async def process_single_asset_pipeline(symbol, semaphore):
     async with semaphore:
         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
@@ -206,7 +273,20 @@ async def execute_swarm_sweep(args):
     await asyncio.to_thread(push_mqtt_telemetry, start_payload)
 
     guardrail.init_db()
+    rrt.ensure_schema(DEFAULT_DB_PATH)  # v1.3: realized_round_trips + component_health
     purge_orphan_crypto_hwm_rows()  # v1.2: stale-corridor hygiene for unheld pairs
+    await purge_unpriceable_ledger_rows()  # v1.3: stale-ledger write-down (BEAT-class)
+
+    # v1.3 fix 3: hand realized edge stats to the brain subprocesses via env
+    # (brains are pure math sandboxes piped scout->brain; env is the only side
+    # channel that leaves their stdin contract intact). None -> priors stay.
+    empirical = rrt.empirical_env_json("CRYPTO", db_path=DEFAULT_DB_PATH)
+    if empirical:
+        os.environ["MACE_EMPIRICAL_KELLY_JSON"] = empirical
+        logger.info(f"[i] Empirical Kelly stats active: {empirical}")
+    else:
+        os.environ.pop("MACE_EMPIRICAL_KELLY_JSON", None)
+
     raw_universe = load_universe()
     if args.limit:
         raw_universe = raw_universe[:args.limit]
@@ -287,7 +367,9 @@ async def execute_swarm_sweep(args):
                         break
                 if held_token and held_token["quantity"] > 0:
                     current_price = await fetch_live_fill_price(symbol, cand.get("current_price", 0.0))
-                    ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
+                    ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(
+                        symbol=symbol, action="SELL", quantity=held_token["quantity"],
+                        execution_price=current_price, reason="REGIME_RISK_OFF")
                     if ledger_receipt.get("success"):
                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
                         register_regime_cooldown(symbol)  # v1.2: block same-token rebuy whipsaw

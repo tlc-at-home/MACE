@@ -1,0 +1,1174 @@
+diff --git a/README.md b/README.md
+index 41ed99d..b98e0f1 100755
+--- a/README.md
++++ b/README.md
+@@ -89,11 +89,12 @@ The TradFi pipeline operates on a periodic cycle (1h intervals in daemon mode),
+    - Rolling 20-day returns and 20-day volatility.
+    - An empirical Markov transition matrix mapping historical state transitions (Bull, Bear, Sideways).
+    - An independent **3-State Gaussian Hidden Markov Model (HMM)** fitted on returns and volatility to "confirm" the market regime.
+-   - A **Dynamic Half-Kelly Sizing** parameter based on backtested historical win-rates, scaled by signal strength (a Sharpe ratio proxy) and capped at 25%.
++   - A **Dynamic Half-Kelly Sizing** parameter. ⚠️ *Truth pass (v1.3)*: the win-rate/payoff priors are **hardcoded constants, not backtested values** (a prior audit found no backtest exists). Since v1.3 they are shrinkage-blended with **realized round-trip history** (see `realized_round_trips` table and `MACE_EMPIRICAL_KELLY_JSON`) — until at least `MACE_KELLY_MIN_ROUNDS` (default 10) realized exits exist, the priors remain in force. Sizing is scaled by signal strength (a Sharpe ratio proxy) and capped at 25%.
+ 3. **Portfolio Allocator ([portfolio_allocator.py](file:///mnt/MACE/equities/swarm/portfolio_allocator.py))**: Takes the outputs of all candidate brains, filters out assets not confirmed to be in a "Bull" regime, clamps individual trade sizes to a maximum of 20% of total equity, and normalizes positions to fit within a 90% deployable cash limit.
+ 4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/equities/swarm/orchestrator.py))**: Manages the pipeline workflow. When trades are approved:
+-   - **Sell orders** are submitted first via an autonomous Google Antigravity Agent (Gemini 2.5 Flash) connected to an `alpaca-mcp-server` command.
+-   - **Buy orders** are placed next using the same agent, executing market orders based on the computed sizing in USD.
++   - **Sell orders** are dispatched first via the direct `BrokerClient` path (`TRIM_PROFIT_TAKING` sells as market orders; full liquidations via `close_position`). The legacy Gemini-agent sell path referenced a tool that was never registered and was removed in v1.1.
++   - **Buy orders** are placed next via the Alpaca paper REST API directly (default `MACE_BUY_DISPATCH=direct`, v1.2). The legacy Gemini agent dispatch (`MACE_BUY_DISPATCH=agent`) is retained as an escape hatch.
++   - **News-guard fail-neutral gate (v1.3)**: if the TradFi news guard has not completed a fresh, healthy audit within `MACE_NEWS_STALENESS_HOURS` (default 12h), new entries are **held** (sells, trims, stop-outs and liquidations stay fully live). Set `MACE_NEWS_GATE=off` to restore the legacy fail-open behavior.
+    - Emits structured state telemetry to the local MQTT broker.
+ 
+ ### B. Crypto Swarm
+@@ -105,7 +106,9 @@ The crypto pipeline is designed around a simulated multi-chain sandbox and runs
+    - Simulated wallet public keys and gas balances for Solana and Arbitrum.
+    - Active coin balances, average entry prices, and available USDT cash (initialized at $10,000 USDT).
+    - Applies portfolio constraints (max 25% single-asset exposure, min $10 trade sizing) and executes simulated BUY/SELL trades directly against the DB ledger.
+-4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/crypto/swarm/orchestrator.py))**: Loops through the crypto universe on UTC HH:05:00 boundaries, pipes OHLCV data into the brain subprocesses concurrently (capped with a semaphore of 10), evaluates results through the Guardrail, and dispatches telemetry.
++   - **Taker fee (v1.3)**: fills are charged a configurable taker fee (default 0.1% = `MACE_TAKER_FEE`) — buys store a fee-inclusive cost basis, sells credit USDT net of fee — so simulated P&L tracks what a real spot account would realize. The crypto shield applies the same fee on stop-out exits (its settlement path bypasses the guardrail).
++   - **Realized round trips (v1.3)**: every completed exit writes a `realized_round_trips` row feeding the empirical Kelly stats.
++4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/crypto/swarm/orchestrator.py))**: Loops through the crypto universe on UTC HH:05:00 boundaries, pipes OHLCV data into the brain subprocesses concurrently (capped with a semaphore of 10), evaluates results through the Guardrail, and dispatches telemetry. Ledger fills mark to a **venue pool** (default KuCoin → Binance → Bybit, `MACE_PRICE_VENUES`, v1.3) so a single-venue outage can no longer revert entries to the brain's stale 4h closes. Each sweep also purges virtual-ledger rows that no venue can price for `MACE_STALE_LEDGER_SWEEPS` (default 3) consecutive sweeps (stale-ledger write-down, recorded as a −100% round trip).
+ 
+ ---
+ 
+@@ -116,7 +119,7 @@ M.A.C.E. implements three parallel, asynchronous risk mitigation layers to prote
+ ### I. Volatility-Calibrated Crypto Shield ([crypto_shield.py](file:///mnt/MACE/crypto/crypto_shield.py))
+ * **Interval**: Runs every 15 minutes as a systemd service.
+ * **Mechanism**: Pulls active holdings from `portfolio.db`, fetches live spot prices via CCXT (KuCoin with Binance failover), and queries the `crypto_hwm` table.
+-* **Rule**: Enforces a dynamic, volatility-calibrated trailing stop-loss (calibrated by the scout between a tight **3.0% and 8.0% limit** based on 3-Sigma historical log returns of 1h candles over 30 days).
++* **Rule**: Enforces a dynamic, volatility-calibrated trailing stop-loss. Since v1.2 the per-position limit is recalibrated daily from genuine volatility: equities use a 20-day daily-bar basis (5%–12% corridor, clamped), crypto uses a 1-minute-bar trailing-24h basis (6%–16% corridor, clamped) — replacing the old static 8% (equities) and the 3–8% scout calibration (crypto).
+ * **Action**: If the drawdown from the High-Water Mark (HWM) breaches the limit, liquidates the position, resets HWM tracking, and returns recovered cash to the USDT wallet. Dynamically ratchets the HWM up if prices set new peaks.
+ 
+ ### II. Deterministic TradFi Shield ([tradfi_shield.py](file:///mnt/MACE/equities/tradfi_shield.py))
+@@ -130,10 +133,11 @@ M.A.C.E. implements three parallel, asynchronous risk mitigation layers to prote
+ * **Mechanism**: Leverages LLMs to evaluate unstructured risk factors.
+ * **Workflow**:
+   1. Fetches current Alpaca stock holdings.
+-  2. Queries the Alpaca Data API for the top 10 latest news headlines for those stocks.
++  2. Aggregates recent headlines for held positions from **Yahoo Finance RSS** (⚠️ *truth pass*: this is the actual source in code — earlier revisions of this README claimed the Alpaca Data API news feed).
+   3. Hands the aggregated context to a Gemini 2.5 Flash agent.
+   4. The agent acts as an autonomous qualitative analyst, ignoring normal volatility but scanning for **existential threats** (e.g., bankruptcy, SEC fraud investigations, catastrophic product failures, CEO arrests).
+-  5. If a severe threat is found, the agent uses the `alpaca-mcp-server` to execute `mcp_alpaca_close_position` for that symbol immediately.
++  5. If a severe threat is found, the agent calls the guard's own `close_position_tool` for that symbol immediately (which also registers a 24h `QUALITATIVE_NEWS_THREAT` cooldown row).
++  6. **Health heartbeat (v1.3)**: every audit cycle upserts a `component_health` row (`healthy` / `degraded` / `idle`). The equities orchestrator's fail-neutral buy gate reads it — while the sensor is blind (e.g. the Gemini key is rate-capped), new buys are held instead of silently proceeding as if every audit had come back clean.
+ 
+ ---
+ 
+@@ -218,3 +222,25 @@ graph TD
+ - **`MACEPostToolCallHook`**: Logs the tool execution status, parameters, and result to `mcp_execution_log` (linked via `trade_id` foreign key) and updates the matching request status to `COMPLETED` or `FAILED`.
+ - **`MACEToolErrorHook`**: Intercepts unhandled tool exceptions and registers them as `FAILED` execution records.
+ 
++---
++
++## 8. v1.3 Operational Reference (Environment Variables)
++
++All v1.3 behavior is env-tunable with safe defaults; no configuration is required to deploy the patch.
++
++| Variable | Default | Scope | Effect |
++| :--- | :--- | :--- | :--- |
++| `MACE_NEWS_GATE` | `on` | equities orchestrator | `on` = fail-neutral buy gate while the news guard is stale/degraded; `off` = legacy fail-open |
++| `MACE_NEWS_STALENESS_HOURS` | `12` | news gate | A healthy audit older than this counts as blind (3× the 4h audit cadence) |
++| `MACE_TAKER_FEE` | `0.001` | guardrail + crypto shield | Virtual-ledger taker fee (fraction, not percent) applied to entries and exits |
++| `MACE_KELLY_MIN_ROUNDS` | `10` | both orchestrators | Minimum realized exits before empirical stats override priors |
++| `MACE_KELLY_LOOKBACK` | `100` | both orchestrators | Round trips aggregated into the empirical edge stats |
++| `MACE_PRICE_VENUES` | `kucoin,binance,bybit` | crypto orchestrator/shield pool | Ordered venue pool for live fills and the priceability oracle |
++| `MACE_STALE_LEDGER_SWEEPS` | `3` | crypto orchestrator | Consecutive unpriceable sweeps before a ledger row is written down |
++| `MACE_BUY_DISPATCH` | `direct` | equities orchestrator | `direct` = Alpaca REST; `agent` = legacy Gemini dispatch (escape hatch) |
++| `MACE_REGIME_COOLDOWN_HOURS` | `24` | crypto orchestrator | Re-entry lock after a Bear-regime RISK-OFF liquidation |
++| `MACE_EMPIRICAL_KELLY_JSON` | *(set per sweep)* | both brains | Internal side channel carrying empirical stats into the brain subprocesses — do not set manually |
++
++**New tables (auto-created, idempotent)**: `realized_round_trips` (per-exit P&L records; `basis` = `ledger_exact` crypto / `dispatch_approx` equities) and `component_health` (heartbeat store powering the fail-neutral gate).
++
++**New shared modules**: `realized_round_trips.py` (round-trip store + empirical Kelly stats + news-guard health) and `price_venues.py` (multi-venue live-price pool) at the repo root.
+diff --git a/crypto/crypto_shield.py b/crypto/crypto_shield.py
+index 756a4a7..0f21d47 100755
+--- a/crypto/crypto_shield.py
++++ b/crypto/crypto_shield.py
+@@ -19,6 +19,16 @@ import paho.mqtt.client as mqtt_client
+ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ 
++# v1.3: shared modules at repo root - realized round-trip store (honest Kelly)
++# and the same taker fee the guardrail virtual ledger now charges. The shield
++# settles stop-outs via raw SQL that bypasses guardrail, so it must apply the
++# fee itself or exits would be gross while entries (post-v1.3) are fee-inclusive.
++if BASE_DIR not in sys.path:
++    sys.path.insert(0, BASE_DIR)
++import realized_round_trips as rrt
++
++TAKER_FEE = float(os.getenv("MACE_TAKER_FEE", "0.001"))
++
+ # MQTT Config
+ MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+@@ -158,11 +168,25 @@ class CryptoShield:
+                 if trailing_drawdown_pct <= -loss_limit:
+                     logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
+ 
+-                    usdt_recovered = qty * live_price
++                    # v1.3: net of taker fee - entries have been fee-inclusive
++                    # in the guardrail since v1.3; a gross exit credit would
++                    # systematically overstate recovered USDT by 0.1% per stop-out.
++                    usdt_recovered = qty * live_price * (1.0 - TAKER_FEE)
++                    fee_charged = qty * live_price * TAKER_FEE
+                     if live_price < 0.01:
+-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT")
++                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
+                     else:
+-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT")
++                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
++
++                    # v1.3: register the realized round trip (ledger-exact: entry
++                    # basis = ledger avg_entry_price, exit = live net of fee) so
++                    # the brains' Kelly stats reflect stop-out outcomes.
++                    rrt.record_trip(
++                        asset_class="CRYPTO", symbol=pair, qty=qty,
++                        entry_price=cost_basis,
++                        exit_price=live_price * (1.0 - TAKER_FEE),
++                        reason="STOP_LOSS_BREACH", basis="ledger_exact",
++                        db_path=DEFAULT_DB_PATH)
+ 
+                     # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
+                     cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
+diff --git a/crypto/swarm/brain.py b/crypto/swarm/brain.py
+index 461e5b6..78f7dd5 100755
+--- a/crypto/swarm/brain.py
++++ b/crypto/swarm/brain.py
+@@ -14,8 +14,26 @@ import sys
+ import warnings
+ warnings.filterwarnings("ignore", category=RuntimeWarning)
+ import json
++import os
+ import numpy as np
+ import pandas as pd
++
++# v1.3: shared empirical-Kelly helpers live at the repo root (pure stdlib -
++# keeps the brain subprocess free of DB/sqlite imports; stats arrive via env).
++_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
++if _BASE_DIR not in sys.path:
++    sys.path.insert(0, _BASE_DIR)
++from realized_round_trips import parse_empirical_env, blend_with_prior
++
++# v1.3: annualization factors per bar interval. The old code hardcoded
++# sqrt(365) (daily bars) while the scout feeds 4h candles - the Sharpe proxy
++# was understated by exactly sqrt(6) = 2.449x, suppressing the confidence
++# multiplier that scales Kelly sizing.
++_PERIODS_PER_YEAR = {
++    "1m": 525600, "5m": 105120, "15m": 35040, "30m": 17520,
++    "1h": 8760, "2h": 4380, "4h": 2190, "6h": 1460, "8h": 1095,
++    "12h": 730, "1d": 365,
++}
+ from hmmlearn.hmm import GaussianHMM
+ 
+ def compute_quantitative_signals(raw_input):
+@@ -32,6 +50,7 @@ def compute_quantitative_signals(raw_input):
+     # FIX: Read 'symbol' and 'prices' to match scout.py output contract
+     ticker = payload.get("symbol", "UNKNOWN/USDT")
+     prices = payload.get("prices", [])
++    timeframe = str(payload.get("timeframe", "4h"))
+ 
+     if not prices:
+         return {"status": "error", "message": "Brain received empty or missing prices payload."}
+@@ -92,6 +111,18 @@ def compute_quantitative_signals(raw_input):
+         base_win_loss_ratio = 1.00
+ 
+     # 6. Quant Fix: Dynamic Fractional Kelly Sizing
++    # v1.3: replace the hardcoded 'backtested' priors with a shrinkage blend
++    # against realized round trips (MACE_EMPIRICAL_KELLY_JSON is set per sweep
++    # by the orchestrator once n >= MACE_KELLY_MIN_ROUNDS realized exits
++    # exist). Until then the priors remain in force - no behavioral cliff.
++    empirical = parse_empirical_env()
++    if empirical is not None:
++        base_win_rate, base_win_loss_ratio = blend_with_prior(
++            empirical, base_win_rate, base_win_loss_ratio,
++            k=empirical.get("prior_strength", 20))
++        kelly_basis = f"empirical n={empirical['n']} wr={base_win_rate:.3f} po={base_win_loss_ratio:.2f}"
++    else:
++        kelly_basis = "prior"
+     loss_rate = 1.0 - base_win_rate
+     theoretical_kelly = base_win_rate - (loss_rate / base_win_loss_ratio)
+ 
+@@ -102,7 +133,8 @@ def compute_quantitative_signals(raw_input):
+ 
+     signal_strength = 0.0
+     if returns_std > 0:
+-        signal_strength = float((recent_returns.mean() / returns_std) * np.sqrt(365))
++        periods = _PERIODS_PER_YEAR.get(timeframe, 2190)
++        signal_strength = float((recent_returns.mean() / returns_std) * np.sqrt(periods))
+ 
+     # FIX: Floor confidence at 0.0 (not 0.2) so losing assets get zero allocation
+     confidence_multiplier = np.clip(signal_strength, 0.0, 1.0)
+@@ -119,7 +151,9 @@ def compute_quantitative_signals(raw_input):
+         "current_price": float(df['close'].iloc[-1]), # Added for downstream execution
+         "regime": regime,
+         "kelly_fraction": round(sanitized_kelly, 4),
+-        "signal_strength": round(signal_strength, 4)
++        "signal_strength": round(signal_strength, 4),
++        "kelly_basis": kelly_basis,  # v1.3: journal/telemetry transparency
++        "bar_timeframe": timeframe
+     }
+ 
+ if __name__ == "__main__":
+diff --git a/crypto/swarm/guardrail.py b/crypto/swarm/guardrail.py
+index 85c0181..4271725 100755
+--- a/crypto/swarm/guardrail.py
++++ b/crypto/swarm/guardrail.py
+@@ -19,6 +19,19 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ MAX_SINGLE_ASSET_EXPOSURE = 0.25
+ MIN_TRADE_SIZE_USD = 10.0
+ 
++# v1.3: virtual-ledger taker fee (default 0.1% = KuCoin spot taker). Pre-v1.3
++# fills were gross, so simulated crypto P&L was systematically optimistic by
++# ~0.2% per round trip versus what a real account would have realized.
++TAKER_FEE = float(os.getenv("MACE_TAKER_FEE", "0.001"))
++
++# v1.3: realized round-trip writer (honest Kelly stats) lives at repo root.
++if BASE_DIR not in sys.path:
++    sys.path.insert(0, BASE_DIR)
++try:
++    import realized_round_trips as rrt
++except Exception:
++    rrt = None
++
+ def get_db_connection(db_path=DEFAULT_DB_PATH):
+     os.makedirs(os.path.dirname(db_path), exist_ok=True)
+     abs_db_path = os.path.abspath(db_path)
+@@ -184,7 +197,7 @@ def get_wallet_balances_summary():
+ 
+     return summary
+ 
+-def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price):
++def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price, reason="LEDGER_SELL"):
+     blockchain = "SOLANA" if "SOL" in symbol else "ARBITRUM"
+     token = symbol.split("/")[0]
+     conn = get_db_connection()
+@@ -195,11 +208,15 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
+         usdt_row = cursor.fetchone()
+         current_usdt_cash = float(usdt_row["quantity"]) if usdt_row else 0.0
+ 
+-        trade_value_usd = quantity * execution_price
+-
+         if action == "BUY":
++            # v1.3: taker fee on entries - cash debited gross+fee, entry cost
++            # basis includes the fee (what a real taker actually pays).
++            gross_value_usd = quantity * execution_price
++            buy_fee_usd = gross_value_usd * TAKER_FEE
++            trade_value_usd = gross_value_usd + buy_fee_usd
++
+             if trade_value_usd > current_usdt_cash:
+-                return {"success": False, "error": "Insufficient USDT cash liquidity to fill asset allocation request."}
++                return {"success": False, "error": "Insufficient USDT cash liquidity (incl. taker fee) to fill asset allocation request."}
+ 
+             if trade_value_usd < MIN_TRADE_SIZE_USD:
+                 return {"success": False, "error": f"Requested transaction size (${trade_value_usd:.2f}) fits beneath minimum scale filter."}
+@@ -230,18 +247,20 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
+             else:
+                 cursor.execute(
+                     "INSERT INTO portfolio (blockchain, token, quantity, avg_entry_price) VALUES (?, ?, ?, ?)",
+-                    (blockchain, token, quantity, execution_price)
++                    (blockchain, token, quantity, execution_price * (1.0 + TAKER_FEE))
+                 )
+                 new_balance = quantity
+-                new_avg_price = execution_price
++                new_avg_price = execution_price * (1.0 + TAKER_FEE)
+ 
+             conn.commit()
++            logger.info(f"[ledger] BUY {symbol} ${gross_value_usd:.2f} gross + ${buy_fee_usd:.2f} taker fee @ ${execution_price}")
+             return {
+                 "success": True,
+                 "action": "BUY",
+                 "symbol": symbol,
+                 "quantity": quantity,
+                 "execution_price": execution_price,
++                "fee_usd": round(buy_fee_usd, 4),
+                 "new_balance": new_balance,
+                 "avg_entry_price": round(new_avg_price, 4),
+                 "remaining_cash": round(current_usdt_cash - trade_value_usd, 2)
+@@ -249,7 +268,7 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
+ 
+         elif action == "SELL":
+             cursor.execute(
+-                "SELECT quantity FROM portfolio WHERE blockchain = ? AND token = ?",
++                "SELECT quantity, avg_entry_price FROM portfolio WHERE blockchain = ? AND token = ?",
+                 (blockchain, token)
+             )
+             balance_row = cursor.fetchone()
+@@ -258,7 +277,11 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
+             if quantity > current_token_holdings:
+                 return {"success": False, "error": f"Attempting to liquidate more {token} than currently held on ledger."}
+ 
+-            usdt_gained = quantity * execution_price
++            # v1.3: taker fee on exits - USDT credited net of fee.
++            gross_gained = quantity * execution_price
++            sell_fee_usd = gross_gained * TAKER_FEE
++            usdt_gained = gross_gained - sell_fee_usd
++            entry_basis = float(balance_row["avg_entry_price"]) if balance_row else 0.0
+ 
+             cursor.execute(
+                 "UPDATE portfolio SET quantity = quantity + ? WHERE blockchain = 'ARBITRUM' AND token = 'USDT'",
+@@ -279,12 +302,28 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
+                 final_holdings = current_token_holdings - quantity
+ 
+             conn.commit()
++
++            # v1.3: every realized exit becomes a realized_round_trips row so
++            # the brains' Kelly priors can be replaced by honest history. Exit
++            # is recorded fee-net; entry basis was stored fee-inclusive on buys
++            # post-v1.3 (legacy rows are off by at most one 0.1% fee).
++            if rrt is not None and entry_basis > 0:
++                rrt.record_trip(
++                    asset_class="CRYPTO", symbol=symbol, qty=quantity,
++                    entry_price=entry_basis,
++                    exit_price=execution_price * (1.0 - TAKER_FEE),
++                    reason=reason, basis="ledger_exact",
++                    db_path=DEFAULT_DB_PATH
++                )
++
++            logger.info(f"[ledger] SELL {symbol} ${gross_gained:.2f} gross - ${sell_fee_usd:.2f} taker fee @ ${execution_price}")
+             return {
+                 "success": True,
+                 "action": "SELL",
+                 "symbol": symbol,
+                 "quantity": quantity,
+                 "execution_price": execution_price,
++                "fee_usd": round(sell_fee_usd, 4),
+                 "new_balance": final_holdings,
+                 "avg_entry_price": 0.0 if final_holdings == 0.0 else balance_row["avg_entry_price"],
+                 "remaining_cash": round(current_usdt_cash + usdt_gained, 2)
+diff --git a/crypto/swarm/orchestrator.py b/crypto/swarm/orchestrator.py
+index e51b4a8..d043d5f 100755
+--- a/crypto/swarm/orchestrator.py
++++ b/crypto/swarm/orchestrator.py
+@@ -20,6 +20,13 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ sys.path.append(os.path.join(BASE_DIR, "crypto/swarm"))
+ import guardrail
+ 
++# v1.3: shared repo-root modules - multi-venue live prices (fix 5) and the
++# realized round-trip store (fix 3, honest Kelly stats).
++if BASE_DIR not in sys.path:
++    sys.path.insert(0, BASE_DIR)
++import price_venues
++import realized_round_trips as rrt
++
+ MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+ MQTT_TOPIC = "mace/telemetry/crypto_sword"
+@@ -82,30 +89,23 @@ def get_seconds_until_next_4h_offset():
+     return int(delta.total_seconds())
+ 
+ async def fetch_live_fill_price(pair, fallback_price):
+-    """v1.1: fetches live spot for virtual-ledger fills so entries and exits mark
+-    off the same feed. Entries previously filled at the brain's stale 4h close while
+-    the crypto shield exits at live spot - a systematic ledger P&L distortion."""
++    """v1.3: ledger fills now price off a venue POOL (default KuCoin -> Binance
++    -> Bybit, MACE_PRICE_VENUES) mirroring the crypto shield's proven failover.
++    v1.1 fetched live spot so entries/exits mark off one feed; v1.1.1 fixed the
++    sync close() clobber; v1.3 removes the single-venue failure mode that
++    silently reverted fills to the brain's stale 4h closes."""
+     try:
+-        import ccxt
+-        exchange = ccxt.kucoin({'enableRateLimit': True})
+-        try:
+-            ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
+-            last = float(ticker['last'])
+-            if last and last > 0:
+-                return last
+-        finally:
+-            # v1.1.1 hotfix: sync ccxt close() returns None (not awaitable) - awaiting it
+-            # raised TypeError in the finally block, clobbering the return value and
+-            # forcing 100% of live-price fetches to fall back to stale brain prices.
+-            try:
+-                maybe = exchange.close()
+-                if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
+-                    await maybe
+-            except Exception:
+-                pass
++        price, venue = await price_venues.fetch_live_price_pool(
++            pair, fallback_price=fallback_price, log=logger.info)
++        if venue is not None:
++            return price
++        if fallback_price:
++            logger.warning(f"[!] Live fill price fetch failed for {pair} on all venues; using brain price.")
++            return float(fallback_price)
++        return 0.0
+     except Exception as e:
+         logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
+-    return float(fallback_price) if fallback_price else 0.0
++        return float(fallback_price) if fallback_price else 0.0
+ 
+ # v1.2: re-entry lock applied after a Bear-regime RISK-OFF liquidation. Default 24h
+ # = 6 sweeps of the 4h cycle (the regime brain must stay Bull for six consecutive
+@@ -173,6 +173,73 @@ def purge_orphan_crypto_hwm_rows():
+     except Exception as e:
+         logger.warning(f"[!] Crypto HWM hygiene sweep failed: {e}")
+ 
++
++# v1.3 fix 6: stale-ledger write-down state. Tokens that cannot price on ANY
++# configured venue for MACE_STALE_LEDGER_SWEEPS consecutive sweeps get their
++# ledger row written down (deleted, exit=0 round trip) instead of silently
++# inflating total_portfolio_value via stale avg-entry proxy pricing (BEAT/USDT
++# sat at ~$989 unpriceable on both KuCoin and Binance since Sept).
++_LEDGER_PRICE_FAILS = {}
++STALE_LEDGER_SWEEPS = int(os.getenv("MACE_STALE_LEDGER_SWEEPS", "3"))
++
++
++async def purge_unpriceable_ledger_rows():
++    """
++    v1.3: removes virtual-ledger rows that no venue can price anymore.
++
++    Canary guard: when >= half of held tokens are unpriceable in the SAME
++    sweep, the purge is skipped entirely - that signature is a venue/network
++    outage, not N simultaneous delistings. Fail counts reset on any successful
++    price read, and daemon restart resets patience (harmless: 3 sweeps = 12h).
++    """
++    try:
++        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++            rows = conn.execute(
++                "SELECT token, quantity, avg_entry_price FROM portfolio WHERE token != 'USDT' AND quantity > 0"
++            ).fetchall()
++        if not rows:
++            return
++
++        priced, unpriced = [], []
++        for token, qty, avg_entry in rows:
++            pair = f"{token}/USDT"
++            ok = await price_venues.price_available_anywhere(pair)
++            if ok:
++                _LEDGER_PRICE_FAILS.pop(token, None)
++                priced.append(token)
++            else:
++                _LEDGER_PRICE_FAILS[token] = _LEDGER_PRICE_FAILS.get(token, 0) + 1
++                unpriced.append((token, qty, avg_entry))
++
++        # Outage canary: never mass-purge on a suspected network/venue outage.
++        if unpriced and len(unpriced) >= max(2, (len(rows) + 1) // 2):
++            logger.warning(
++                f"[i] Stale-ledger purge skipped: {len(unpriced)}/{len(rows)} tokens unpriceable "
++                f"(suspected venue/network outage, not delisting)")
++            return
++
++        for token, qty, avg_entry in unpriced:
++            fails = _LEDGER_PRICE_FAILS.get(token, 0)
++            if fails < STALE_LEDGER_SWEEPS:
++                logger.info(
++                    f"[i] {token}/USDT unpriceable ({fails}/{STALE_LEDGER_SWEEPS} sweeps); "
++                    f"write-down deferred pending confirmation")
++                continue
++            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++                conn.execute("DELETE FROM portfolio WHERE token = ?", (token,))
++                conn.commit()
++            rrt.record_trip(
++                asset_class="CRYPTO", symbol=f"{token}/USDT", qty=float(qty),
++                entry_price=float(avg_entry), exit_price=0.0,
++                reason="STALE_LEDGER_WRITE_DOWN", basis="ledger_exact",
++                db_path=DEFAULT_DB_PATH)
++            logger.warning(
++                f"[!] STALE LEDGER WRITE-DOWN: {token} removed from virtual ledger "
++                f"(unpriceable across all venues for {fails} sweeps, cost basis "
++                f"${float(qty) * float(avg_entry):.2f} written off)")
++    except Exception as e:
++        logger.warning(f"[!] Stale-ledger purge sweep failed: {e}")
++
+ async def process_single_asset_pipeline(symbol, semaphore):
+     async with semaphore:
+         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
+@@ -206,7 +273,20 @@ async def execute_swarm_sweep(args):
+     await asyncio.to_thread(push_mqtt_telemetry, start_payload)
+ 
+     guardrail.init_db()
++    rrt.ensure_schema(DEFAULT_DB_PATH)  # v1.3: realized_round_trips + component_health
+     purge_orphan_crypto_hwm_rows()  # v1.2: stale-corridor hygiene for unheld pairs
++    await purge_unpriceable_ledger_rows()  # v1.3: stale-ledger write-down (BEAT-class)
++
++    # v1.3 fix 3: hand realized edge stats to the brain subprocesses via env
++    # (brains are pure math sandboxes piped scout->brain; env is the only side
++    # channel that leaves their stdin contract intact). None -> priors stay.
++    empirical = rrt.empirical_env_json("CRYPTO", db_path=DEFAULT_DB_PATH)
++    if empirical:
++        os.environ["MACE_EMPIRICAL_KELLY_JSON"] = empirical
++        logger.info(f"[i] Empirical Kelly stats active: {empirical}")
++    else:
++        os.environ.pop("MACE_EMPIRICAL_KELLY_JSON", None)
++
+     raw_universe = load_universe()
+     if args.limit:
+         raw_universe = raw_universe[:args.limit]
+@@ -287,7 +367,9 @@ async def execute_swarm_sweep(args):
+                         break
+                 if held_token and held_token["quantity"] > 0:
+                     current_price = await fetch_live_fill_price(symbol, cand.get("current_price", 0.0))
+-                    ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
++                    ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(
++                        symbol=symbol, action="SELL", quantity=held_token["quantity"],
++                        execution_price=current_price, reason="REGIME_RISK_OFF")
+                     if ledger_receipt.get("success"):
+                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
+                         register_regime_cooldown(symbol)  # v1.2: block same-token rebuy whipsaw
+diff --git a/crypto/swarm/scout.py b/crypto/swarm/scout.py
+index e07c427..09a6b8a 100755
+--- a/crypto/swarm/scout.py
++++ b/crypto/swarm/scout.py
+@@ -23,7 +23,10 @@ async def fetch_market_data(symbol, timeframe='4h', limit=540):
+ 
+         payload = {
+             "symbol": symbol,
+-            "prices": close_prices
++            "prices": close_prices,
++            # v1.3: brain needs the bar interval to annualize its Sharpe proxy
++            # correctly (sqrt(365) on 4h bars understated it by sqrt(6) = 2.45x).
++            "timeframe": timeframe
+         }
+         print(json.dumps(payload))
+ 
+diff --git a/equities/swarm/brain.py b/equities/swarm/brain.py
+index 7bdfc90..ff58d0b 100755
+--- a/equities/swarm/brain.py
++++ b/equities/swarm/brain.py
+@@ -1,8 +1,16 @@
+ #!/usr/bin/env python3.11
+ import sys
++import os
+ import json
+ import numpy as np
+ import pandas as pd
++
++# v1.3: shared empirical-Kelly helpers live at the repo root (pure stdlib -
++# stats arrive via the MACE_EMPIRICAL_KELLY_JSON env var set by the orchestrator).
++_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
++if _BASE_DIR not in sys.path:
++    sys.path.insert(0, _BASE_DIR)
++from realized_round_trips import parse_empirical_env, blend_with_prior
+ from hmmlearn import hmm
+ from sklearn.preprocessing import StandardScaler
+ 
+@@ -85,6 +93,17 @@ def run_brain():
+         else:
+             win_rate, win_loss_ratio = 0.46, 1.00
+ 
++        # v1.3: shrinkage blend against realized round trips once the sample
++        # reaches MACE_KELLY_MIN_ROUNDS; priors remain in force until then.
++        empirical = parse_empirical_env()
++        if empirical is not None:
++            win_rate, win_loss_ratio = blend_with_prior(
++                empirical, win_rate, win_loss_ratio,
++                k=empirical.get("prior_strength", 20))
++            kelly_basis = f"empirical n={empirical['n']} wr={win_rate:.3f} po={win_loss_ratio:.2f}"
++        else:
++            kelly_basis = "prior"
++
+         loss_rate = 1.0 - win_rate
+         theoretical_kelly = win_rate - (loss_rate / win_loss_ratio)
+ 
+@@ -97,7 +116,8 @@ def run_brain():
+             "current_state": today_state,
+             "signal_strength": round(float(signal_strength), 4),
+             "ml_confirmed": bool(is_ml_confirmed),
+-            "calculated_kelly": round(float(asset_kelly), 4)
++            "calculated_kelly": round(float(asset_kelly), 4),
++            "kelly_basis": kelly_basis  # v1.3: journal/telemetry transparency
+         }
+         print(json.dumps(result))
+ 
+diff --git a/equities/swarm/orchestrator.py b/equities/swarm/orchestrator.py
+index b22a3c1..a512718 100755
+--- a/equities/swarm/orchestrator.py
++++ b/equities/swarm/orchestrator.py
+@@ -44,6 +44,9 @@ if BASE_DIR not in sys.path:
+ 
+ from brokers import get_client_by_name
+ 
++# v1.3: shared health/round-trip store at repo root (BASE_DIR already on sys.path).
++import realized_round_trips as rrt
++
+ # MQTT Broker config
+ MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+@@ -467,6 +470,31 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+     except Exception as e:
+         return f"Failed MCP execution: {str(e)}"
+ 
++def record_equity_sell_trip(symbol, reason, trim_usd=None):
++    """v1.3: records a realized (approximate) round trip for an equities exit.
++    Entry basis and position size come from the live Alpaca position snapshot;
++    exit is the position's current_price at dispatch time (flagged
++    dispatch_approx - market-order fills can slip from it). Never raises."""
++    try:
++        from brokers import get_client_for_symbol
++        client = get_client_for_symbol(symbol)
++        pos = client.get_position(symbol)
++        if not pos:
++            return
++        qty = float(pos.get("qty", 0.0))
++        avg_entry = float(pos.get("avg_entry_price", 0.0))
++        exit_ref = float(pos.get("current_price", 0.0))
++        if qty <= 0 or avg_entry <= 0 or exit_ref <= 0:
++            return
++        if trim_usd is not None:
++            qty = min(qty, trim_usd / exit_ref)
++        rrt.record_trip(
++            asset_class="TRADFI", symbol=symbol, qty=qty,
++            entry_price=avg_entry, exit_price=exit_ref,
++            reason=reason, basis="dispatch_approx", db_path=DEFAULT_DB_PATH)
++    except Exception:
++        pass
++
+ async def run_sweep(args):
+     symbols = []
+     sources = {}
+@@ -478,6 +506,18 @@ async def run_sweep(args):
+ 
+     print(f"[*] Starting async scanning of {len(symbols)} equities assets...")
+ 
++    # v1.3 fix 3: hand realized edge stats to the brain subprocesses via env
++    # (scout stdout still pipes into brain stdin unchanged; env is the only
++    # side channel that preserves that contract). None -> priors stay in force.
++    rrt.ensure_schema(DEFAULT_DB_PATH)
++    empirical = rrt.empirical_env_json("TRADFI", db_path=DEFAULT_DB_PATH)
++    if empirical:
++        os.environ["MACE_EMPIRICAL_KELLY_JSON"] = empirical
++        print(f"[i] Empirical Kelly stats active: {empirical}")
++    else:
++        os.environ.pop("MACE_EMPIRICAL_KELLY_JSON", None)
++
++
+     sem = asyncio.Semaphore(3)
+     tasks = [sem_pipeline(symbol, sources.get(symbol, "static"), sem) for symbol in symbols]
+     scan_results = await asyncio.gather(*tasks)
+@@ -517,6 +557,23 @@ async def run_sweep(args):
+     if is_live_execution:
+         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+         print(f"[*] Starting live execution run: {run_id}")
++
++        # v1.3 fix 1: FAIL-NEUTRAL news-guard gate. The guard (sole remaining
++        # Gemini consumer, 4h cadence) is blind while its API key sits at the
++        # 429 monthly cap; pre-v1.3 the system silently proceeded as if every
++        # audit had come back clean (fail-open). Neutral posture: NEW entries
++        # are held until a fresh healthy audit lands; sells, trims, stop-outs
++        # and liquidations remain fully live (no gross risk added, existing
++        # risk fully managed). MACE_NEWS_GATE=off restores legacy fail-open.
++        if approved_trades:
++            gate_ok, gate_detail = rrt.news_gate_allows_buys(DEFAULT_DB_PATH)
++            if not gate_ok:
++                print(f"[i] NEWS GUARD FAIL-NEUTRAL: holding {len(approved_trades)} new buy(s) "
++                      f"- {gate_detail}. Sells and risk-off remain live. "
++                      f"Set MACE_NEWS_GATE=off to override.")
++                approved_trades = []
++                execution_status = "FAIL_NEUTRAL_NEWS_GUARD: " + gate_detail
++
+         # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
+         # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
+         # hatch use only.
+@@ -569,11 +626,13 @@ async def run_sweep(args):
+                 try:
+                     if action == "TRIM_PROFIT_TAKING":
+                         trim_usd = float(s.get("trim_amount_usd", 0.0))
++                        record_equity_sell_trip(symbol, "TRIM_PROFIT_TAKING", trim_usd=trim_usd)  # v1.3
+                         receipt = submit_direct_market_order(symbol, trim_usd, "sell")
+                         ok = receipt.get("ok", False)
+                         print(f"[+] TRIM SELL {symbol} ${trim_usd:.2f}: {'submitted' if ok else 'REJECTED: ' + str(receipt.get('message'))}")
+                     else:
+                         # BEAR_REGIME_LIQUIDATION and any other risk-off sell: full exit
++                        record_equity_sell_trip(symbol, action)  # v1.3
+                         client = get_client_for_symbol(symbol)
+                         await asyncio.to_thread(client.close_position, symbol)
+                         ok = True
+@@ -663,6 +722,7 @@ async def run_sweep(args):
+                 from brokers import get_client_for_symbol
+                 for t in retry_sells:
+                     try:
++                        record_equity_sell_trip(t[1], "RECOVERY_SELL")  # v1.3
+                         client = get_client_for_symbol(t[1])
+                         await asyncio.to_thread(client.close_position, t[1])
+                         print(f"[+] Recovery LIQUIDATION SELL {t[1]} dispatched via BrokerClient.close_position")
+diff --git a/equities/tradfi_news_guard.py b/equities/tradfi_news_guard.py
+index 47c7fb5..86b1756 100755
+--- a/equities/tradfi_news_guard.py
++++ b/equities/tradfi_news_guard.py
+@@ -29,6 +29,9 @@ if BASE_DIR not in sys.path:
+ 
+ from brokers import get_client_for_symbol, get_client_by_name
+ 
++# v1.3: shared health/round-trip store at repo root (already on sys.path above).
++import realized_round_trips as rrt
++
+ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+@@ -166,6 +169,17 @@ def gather_guard_context():
+         "news": news_headlines if news_headlines else ["No recent news found."]
+     }
+ 
++def _heartbeat(status, detail=""):
++    """v1.3: persists guard health so the equities orchestrator's fail-neutral
++    buy gate can see it. `healthy` refreshes last_healthy_at; degraded/idle do
++    not - a blind sensor must never read as green by omission."""
++    ok = rrt.write_news_guard_heartbeat(status, detail, db_path=DEFAULT_DB_PATH)
++    if status == "healthy":
++        logger.info(f"[*] News Guard heartbeat: healthy ({(detail or '')[:80]})")
++    else:
++        logger.warning(f"[!] News Guard heartbeat: {status} ({(detail or '')[:80]}) [persisted={ok}]")
++    return ok
++
+ async def run_qualitative_audit():
+     logger.info("[*] Booting M.A.C.E. Qualitative News Guard...")
+     run_id = f"news_guard_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+@@ -173,6 +187,8 @@ async def run_qualitative_audit():
+ 
+     context_data = gather_guard_context()
+     if not context_data:
++        # v1.3: idle is NOT healthy - the cycle ran but checked nothing.
++        _heartbeat("idle", "No universe data or positions available")
+         return json.dumps({"status": "idle", "reason": "No universe data or positions available."})
+ 
+     user_prompt = (
+@@ -209,10 +225,21 @@ async def run_qualitative_audit():
+         if response:
+             try:
+                 response_text = await response.text()
+-            except Exception:
+-                response_text = json.dumps({"status": "safe", "details": "News audit completed."})
++                # v1.3: a completed chat with a readable verdict is the ONLY
++                # path that writes a healthy heartbeat.
++                try:
++                    verdict_status = json.loads(response_text).get("status", "unknown")
++                except Exception:
++                    verdict_status = "unparsed"
++                _heartbeat("healthy", f"verdict={verdict_status}")
++            except Exception as e:
++                # v1.3: the old code fabricated {"status": "safe"} here - a
++                # fail-open lie. An unreadable response is degraded, not safe.
++                response_text = json.dumps({"status": "degraded", "details": f"News audit response unreadable: {e}"})
++                _heartbeat("degraded", f"response.text() failed: {e}")
+         else:
+             response_text = json.dumps({"error": "No response generated by news guard agent."})
++            _heartbeat("degraded", "no response generated by agent")
+ 
+     return response_text
+ 
+@@ -250,6 +277,10 @@ async def main():
+                 result = await run_qualitative_audit()
+                 push_telemetry(result)
+             except Exception as e:
++                # v1.3: record the failure (429 cap, network, SDK fault) in
++                # component_health so the orchestrator's fail-neutral gate sees
++                # a blind sensor instead of assuming "no news is good news".
++                _heartbeat("degraded", f"daemon cycle exception: {e}")
+                 logger.error(f"[!] Error in News Guard daemon cycle: {e}")
+             logger.info(f"[*] Sleeping for {args.interval} seconds before next news sweep...")
+             await asyncio.sleep(args.interval)
+diff --git a/equities/tradfi_shield.py b/equities/tradfi_shield.py
+index 5342e58..b3f63a8 100755
+--- a/equities/tradfi_shield.py
++++ b/equities/tradfi_shield.py
+@@ -128,6 +128,19 @@ class TradFiShield:
+                             logger.error(f"[!] {symbol}: cooldown/HWM registration failed ({cd_err}). Dispatching liquidation regardless.")
+ 
+                         # 2) Dispatch the liquidation via the direct BrokerClient path.
++                        # v1.3: record the realized round trip first (entry basis =
++                        # Alpaca avg_entry_price, exit = live price at dispatch,
++                        # flagged dispatch_approx) so honest Kelly stats include
++                        # stop-out outcomes. Never blocks the liquidation itself.
++                        try:
++                            import realized_round_trips as _rrt
++                            _rrt.record_trip(
++                                asset_class="TRADFI", symbol=symbol, qty=qty,
++                                entry_price=avg_entry, exit_price=live_price,
++                                reason="STOP_LOSS_BREACH", basis="dispatch_approx",
++                                db_path=DEFAULT_DB_PATH)
++                        except Exception:
++                            pass
+                         logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
+                         await asyncio.to_thread(symbol_client.close_position, symbol)
+ 
+diff --git a/price_venues.py b/price_venues.py
+new file mode 100644
+index 0000000..7683dff
+--- /dev/null
++++ b/price_venues.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3.11
++"""
++M.A.C.E. v1.3 shared module: multi-venue live price pool.
++
++Fix 5: the crypto orchestrator's fetch_live_fill_price was KuCoin-only, so a
++single-venue outage silently reverted virtual-ledger fills to the brain's
++stale 4h closes - the exact distortion v1.1.1 fixed. The crypto shield already
++fails over KuCoin -> Binance; this module gives the orchestrator's LEDGER
++fills the same resilience, env-tunable via MACE_PRICE_VENUES.
++
++Fix 6 reuses the pool as the "is this token priceable at all" oracle for the
++stale-ledger write-down purge (BEAT/USDT cleanup).
++
++Import contract: repo root must be on sys.path (see realized_round_trips.py).
++Venues are public ticker endpoints - no API keys required. Venue failures are
++isolated per venue and fall through to the next; total failure returns the
++caller's fallback (same contract as the old single-venue behavior).
++"""
++
++import os
++import asyncio
++
++DEFAULT_VENUES = "kucoin,binance,bybit"
++
++
++def get_venue_list():
++    raw = os.getenv("MACE_PRICE_VENUES", DEFAULT_VENUES)
++    venues = [v.strip().lower() for v in raw.split(",") if v.strip()]
++    return venues or [v.strip().lower() for v in DEFAULT_VENUES.split(",")]
++
++
++async def fetch_live_price_pool(pair, fallback_price=None, log=None, venue_list=None):
++    """Tries each venue in order via ccxt (sync exchange wrapped in a worker
++    thread, mirroring the shield's proven pattern). Returns
++    (price_or_fallback, venue_or_None). Non-primary venue service is logged
++    when a `log` callable is supplied (orchestrator passes logger.info)."""
++    import ccxt
++    venues = venue_list if venue_list is not None else get_venue_list()
++    primary = venues[0] if venues else None
++    first_err = None
++    for venue in venues:
++        exchange = None
++        try:
++            exchange_cls = getattr(ccxt, venue, None)
++            if exchange_cls is None:
++                continue
++            exchange = exchange_cls({'enableRateLimit': True})
++            ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
++            last = float(ticker['last'])
++            if last and last > 0:
++                if log and primary and venue != primary:
++                    log(f"[i] Live price {pair} served by {venue} (primary {primary} failed: {first_err})")
++                return last, venue
++        except Exception as e:
++            if first_err is None:
++                first_err = str(e)
++        finally:
++            if exchange is not None:
++                try:
++                    maybe = exchange.close()
++                    if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
++                        await maybe
++                except Exception:
++                    pass
++    return (float(fallback_price) if fallback_price else 0.0), None
++
++
++async def price_available_anywhere(pair):
++    """Boolean oracle for the stale-ledger purge: a token that cannot price on
++    ANY configured venue is a delisting candidate, not a network blip."""
++    price, venue = await fetch_live_price_pool(pair)
++    return (venue is not None)
+diff --git a/realized_round_trips.py b/realized_round_trips.py
+new file mode 100644
+index 0000000..5dcae56
+--- /dev/null
++++ b/realized_round_trips.py
+@@ -0,0 +1,270 @@
++#!/usr/bin/env python3.11
++"""
++M.A.C.E. v1.3 shared module: realized round trips + component health.
++
++Fix 3 (honest Kelly): every completed SELL with a known entry basis writes a row
++into realized_round_trips. The orchestrators aggregate the last N rows into
++empirical edge stats (win rate, payoff ratio) and hand them to the brains via
++the MACE_EMPIRICAL_KELLY_JSON env var; the brains shrinkage-blend them with the
++hardcoded priors. Until n >= MACE_KELLY_MIN_ROUNDS the priors remain in force.
++
++Fix 1 (news-guard fail-neutral): the tradfi news guard writes a heartbeat into
++component_health after every audit cycle. The equities orchestrator's buy gate
++reads it: no fresh healthy audit -> new entries are held (fail-NEUTRAL: sells,
++trims, stop-outs and liquidations stay fully live).
++
++Import contract: this file lives at the MACE repo root; consumers must put the
++repo root on sys.path before importing (mirrors brokers/__init__.py usage).
++"""
++
++import os
++import sys
++import json
++import sqlite3
++from datetime import datetime, timedelta, timezone
++
++BASE_DIR = os.path.abspath(os.path.dirname(__file__))
++DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config", "portfolio.db")
++
++# Idempotent schema guard: one CREATE TABLE IF NOT EXISTS attempt per db path
++# per process lifetime (the 60s daemon sweep must not re-run DDL every cycle).
++_SCHEMA_OK = set()
++
++KELLY_PRIOR_STRENGTH = 20  # shrinkage k: empirical weight = n / (n + k)
++
++
++def ensure_schema(db_path=DEFAULT_DB_PATH):
++    db_path = os.path.abspath(db_path)
++    if db_path in _SCHEMA_OK:
++        return
++    try:
++        os.makedirs(os.path.dirname(db_path), exist_ok=True)
++        with sqlite3.connect(db_path, timeout=30.0) as conn:
++            conn.execute("""
++                CREATE TABLE IF NOT EXISTS realized_round_trips (
++                    trip_id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    asset_class TEXT NOT NULL,
++                    symbol TEXT NOT NULL,
++                    qty REAL NOT NULL,
++                    entry_price REAL NOT NULL,
++                    exit_price REAL NOT NULL,
++                    pnl_usd REAL NOT NULL,
++                    pnl_pct REAL NOT NULL,
++                    reason TEXT,
++                    basis TEXT NOT NULL DEFAULT 'ledger_exact',
++                    closed_at TEXT NOT NULL
++                )
++            """)
++            conn.execute("""
++                CREATE TABLE IF NOT EXISTS component_health (
++                    component TEXT PRIMARY KEY,
++                    last_attempt_at TEXT,
++                    last_healthy_at TEXT,
++                    status TEXT NOT NULL,
++                    detail TEXT
++                )
++            """)
++        _SCHEMA_OK.add(db_path)
++    except Exception:
++        # Never let schema bookkeeping kill a trading path; the next writer
++        # or sweep will retry the DDL.
++        pass
++
++
++# ----------------------------------------------------------------------------
++# Fix 3: round-trip writer + empirical edge stats
++# ----------------------------------------------------------------------------
++
++def record_trip(asset_class, symbol, qty, entry_price, exit_price,
++                reason="UNSPECIFIED", basis="ledger_exact", db_path=DEFAULT_DB_PATH):
++    """Records one realized exit. exit_price=0 models a total write-down
++    (STALE_LEDGER_WRITE_DOWN) -> pnl_pct = -1.0. Failures are swallowed:
++    a stats-recording problem must never block an actual liquidation."""
++    try:
++        ensure_schema(db_path)
++        entry_price = float(entry_price)
++        exit_price = float(exit_price)
++        qty = float(qty)
++        pnl_usd = (exit_price - entry_price) * qty
++        pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
++        with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
++            conn.execute(
++                """INSERT INTO realized_round_trips
++                   (asset_class, symbol, qty, entry_price, exit_price, pnl_usd, pnl_pct, reason, basis, closed_at)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                (asset_class, symbol, qty, entry_price, exit_price,
++                 pnl_usd, pnl_pct, reason, basis,
++                 datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
++            )
++        return True
++    except Exception:
++        return False
++
++
++def load_empirical_edge_stats(asset_class, lookback=100, db_path=DEFAULT_DB_PATH):
++    """Returns {n, win_rate, payoff, avg_win_pct, avg_loss_pct} over the last
++    `lookback` realized exits for the asset class, or None when no rounds
++    exist. A payoff of None means zero losing rounds observed (payoff is
++    unbounded; the caller should keep the prior payoff ratio)."""
++    try:
++        with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
++            rows = conn.execute(
++                "SELECT pnl_pct, pnl_usd FROM realized_round_trips WHERE asset_class = ? ORDER BY trip_id DESC LIMIT ?",
++                (asset_class, int(lookback))
++            ).fetchall()
++    except Exception:
++        return None
++    if not rows:
++        return None
++    pcts = [float(r[0]) for r in rows]
++    usds = [float(r[1]) for r in rows]
++    n = len(pcts)
++    wins = [p for p, u in zip(pcts, usds) if u > 0]
++    losses = [p for p, u in zip(pcts, usds) if u <= 0]
++    win_rate = len(wins) / n if n else 0.0
++    avg_win = sum(wins) / len(wins) if wins else 0.0
++    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
++    payoff = (avg_win / avg_loss) if (avg_loss > 0 and wins) else None
++    return {
++        "n": n,
++        "win_rate": round(win_rate, 4),
++        "payoff": round(payoff, 4) if payoff is not None else None,
++        "avg_win_pct": round(avg_win, 4),
++        "avg_loss_pct": round(avg_loss, 4),
++    }
++
++
++def empirical_env_json(asset_class, db_path=DEFAULT_DB_PATH,
++                       min_rounds=None, lookback=None):
++    """Builds the MACE_EMPIRICAL_KELLY_JSON payload for a sweep, or returns
++    None when the empirical sample is below the minimum (priors stay in
++    force - no behavioral cliff on fresh installs)."""
++    if min_rounds is None:
++        min_rounds = int(os.getenv("MACE_KELLY_MIN_ROUNDS", "10"))
++    if lookback is None:
++        lookback = int(os.getenv("MACE_KELLY_LOOKBACK", "100"))
++    stats = load_empirical_edge_stats(asset_class, lookback=lookback, db_path=db_path)
++    if not stats or stats["n"] < max(1, min_rounds):
++        return None
++    stats["asset_class"] = asset_class
++    stats["prior_strength"] = KELLY_PRIOR_STRENGTH
++    return json.dumps(stats)
++
++
++def blend_with_prior(empirical, prior_win_rate, prior_payoff, k=KELLY_PRIOR_STRENGTH):
++    """Shrinkage blend: w = n / (n + k). k=20 means 20 prior-equivalent
++    observations back the hardcoded priors, so small samples move the
++    estimate gently and the priors dominate until real history accrues."""
++    n = float(empirical.get("n", 0))
++    if n <= 0:
++        return prior_win_rate, prior_payoff
++    w = n / (n + float(k))
++    emp_wr = float(empirical.get("win_rate", prior_win_rate))
++    wr = w * emp_wr + (1 - w) * prior_win_rate
++    emp_po = empirical.get("payoff")
++    if emp_po is None:
++        po = prior_payoff
++    else:
++        po = w * float(emp_po) + (1 - w) * prior_payoff
++    return wr, po
++
++
++def parse_empirical_env(raw=None):
++    """Brain-side parse of MACE_EMPIRICAL_KELLY_JSON. Returns None on any
++    malformed/missing input (brains must never fault on bad telemetry)."""
++    if raw is None:
++        raw = os.environ.get("MACE_EMPIRICAL_KELLY_JSON")
++    if not raw:
++        return None
++    try:
++        stats = json.loads(raw)
++        if not isinstance(stats, dict) or float(stats.get("n", 0)) <= 0:
++            return None
++        if stats.get("win_rate") is None:
++            return None
++        return stats
++    except Exception:
++        return None
++
++
++# ----------------------------------------------------------------------------
++# Fix 1: news-guard heartbeat + fail-neutral buy gate
++# ----------------------------------------------------------------------------
++
++def write_news_guard_heartbeat(status, detail="", db_path=DEFAULT_DB_PATH,
++                               component="tradfi_news_guard"):
++    """Upserts the guard's health row. `healthy` refreshes last_healthy_at;
++    every other status (degraded / idle) records the attempt only, so the
++    last_healthy_at timestamp keeps telling the truth about how long the
++    sensor has been blind. Never raises."""
++    try:
++        ensure_schema(db_path)
++        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
++        with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
++            conn.execute(
++                """INSERT INTO component_health (component, last_attempt_at, last_healthy_at, status, detail)
++                   VALUES (?, ?, ?, ?, ?)
++                   ON CONFLICT(component) DO UPDATE SET
++                     last_attempt_at = excluded.last_attempt_at,
++                     status = excluded.status,
++                     detail = excluded.detail,
++                     last_healthy_at = CASE WHEN excluded.status = 'healthy'
++                                            THEN excluded.last_healthy_at
++                                            ELSE component_health.last_healthy_at END""",
++                (component, now_str, now_str if status == "healthy" else None, status,
++                 (detail or "")[:200])
++            )
++        return True
++    except Exception:
++        return False
++
++
++def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
++    """Returns (healthy, human_detail). Staleness default = 12h = 3x the 4h
++    audit cadence (tolerates two consecutive missed audits). Missing table,
++    missing row and unparseable timestamps all resolve to NOT healthy - a
++    blind sensor must never read as green by accident."""
++    if staleness_hours is None:
++        staleness_hours = float(os.getenv("MACE_NEWS_STALENESS_HOURS", "12"))
++    try:
++        with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
++            row = conn.execute(
++                "SELECT last_healthy_at, status FROM component_health WHERE component = 'tradfi_news_guard'"
++            ).fetchone()
++    except Exception:
++        return False, "component_health table missing (news guard has never reported)"
++    if not row:
++        return False, "no news-guard audit on record"
++    last_healthy, status = row
++    if not last_healthy:
++        return False, f"news guard status={status or 'unknown'}, never completed a healthy audit"
++    try:
++        lh = datetime.strptime(last_healthy, "%Y-%m-%dT%H:%M:%SZ")
++    except Exception:
++        return False, f"unparseable last_healthy_at '{last_healthy}'"
++    age = (datetime.utcnow() - lh).total_seconds() / 3600.0
++    if age > staleness_hours:
++        return False, (f"last healthy audit {last_healthy} "
++                       f"({age:.1f}h ago > {staleness_hours:.0f}h staleness window)")
++    return True, f"healthy as of {last_healthy} (age {age:.1f}h)"
++
++
++def news_gate_allows_buys(db_path=DEFAULT_DB_PATH):
++    """The orchestrator-side gate decision. MACE_NEWS_GATE=off bypasses the
++    check entirely (legacy fail-open escape hatch). Returns (allowed, detail)."""
++    mode = os.getenv("MACE_NEWS_GATE", "on").strip().lower()
++    if mode in ("off", "0", "false", "no"):
++        return True, "news gate disabled via MACE_NEWS_GATE=off (fail-open legacy behavior)"
++    return news_guard_is_healthy(db_path=db_path)
++
++
++if __name__ == "__main__":
++    # Manual smoke: python3 realized_round_trips.py [db_path]
++    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DB_PATH
++    ensure_schema(path)
++    print(f"[rrt] schema ensured at {path}")
++    stats_c = load_empirical_edge_stats("CRYPTO", db_path=path)
++    stats_t = load_empirical_edge_stats("TRADFI", db_path=path)
++    print(f"[rrt] CRYPTO rounds: {stats_c}")
++    print(f"[rrt] TRADFI rounds: {stats_t}")
++    print(f"[rrt] news gate: {news_gate_allows_buys(path)}")
+diff --git a/setup_db.sql b/setup_db.sql
+index 2b00ffb..76d2a02 100755
+--- a/setup_db.sql
++++ b/setup_db.sql
+@@ -124,6 +124,35 @@ CREATE TABLE IF NOT EXISTS portfolio (
+     PRIMARY KEY (blockchain, token)
+ );
+ 
++-- v1.3: Realized Round Trips (honest Kelly statistics). Every completed exit
++-- with a known entry basis writes one row; orchestrators aggregate the last N
++-- rows into empirical win-rate/payoff stats and blend them into the brains'
++-- Kelly priors via MACE_EMPIRICAL_KELLY_JSON.
++CREATE TABLE IF NOT EXISTS realized_round_trips (
++    trip_id INTEGER PRIMARY KEY AUTOINCREMENT,
++    asset_class TEXT NOT NULL,              -- 'CRYPTO' | 'TRADFI'
++    symbol TEXT NOT NULL,
++    qty REAL NOT NULL,
++    entry_price REAL NOT NULL,
++    exit_price REAL NOT NULL,               -- 0 = total write-down (delisted/unpriceable)
++    pnl_usd REAL NOT NULL,
++    pnl_pct REAL NOT NULL,
++    reason TEXT,                            -- STOP_LOSS_BREACH | REGIME_RISK_OFF | BEAR_REGIME_LIQUIDATION | TRIM_PROFIT_TAKING | QUALITATIVE_NEWS_THREAT | STALE_LEDGER_WRITE_DOWN | ...
++    basis TEXT NOT NULL DEFAULT 'ledger_exact',  -- 'ledger_exact' | 'dispatch_approx'
++    closed_at TEXT NOT NULL
++);
++
++-- v1.3: Component Health heartbeats. The tradfi news guard upserts its row
++-- every 4h cycle; the equities orchestrator's fail-neutral buy gate blocks
++-- NEW entries while no fresh healthy audit exists (sells/risk-off unaffected).
++CREATE TABLE IF NOT EXISTS component_health (
++    component TEXT PRIMARY KEY,
++    last_attempt_at TEXT,
++    last_healthy_at TEXT,
++    status TEXT NOT NULL,                   -- 'healthy' | 'degraded' | 'idle'
++    detail TEXT
++);
++
+ -- ----------------------------------------------------------------------------
+ -- 4. Database Indexes for Query Optimization
+ -- ----------------------------------------------------------------------------
