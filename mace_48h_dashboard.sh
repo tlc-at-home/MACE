@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# MACE TURNAROUND v1 -- 48H DASHBOARD  (v1.1)
+# MACE TURNAROUND v1 -- 48H DASHBOARD  (v1.2)
+# v1.2 adds: [11] v1.3 fixes - realized round trips (empirical Kelly sample,
+#   last exits, 48h exit reasons), news-guard heartbeat + fail-neutral gate
+#   markers, taker-fee ledger lines, venue failover lines, stale-ledger
+#   write-down activity. Sections degrade gracefully on a pre-v1.3 DB.
 # v1.1 fixes: (a) auto-locates portfolio.db from this script's directory,
 #   (b) works WITHOUT the sqlite3 CLI via python3 fallback (read-only),
 #   (c) no more integer-expected crashes when DB is missing,
 #   (d) new [10] crypto virtual ledger snapshot (BONK staged-exit check).
 # Override DB manually if needed:  MACE_DB=/full/path/portfolio.db ./script
 # If journal sections come back empty, re-run with: sudo bash <script>
-# ============================================================================
+# =====================================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB="${MACE_DB:-}"
 if [ -z "$DB" ]; then
@@ -163,6 +167,59 @@ Q "SELECT blockchain, token, ROUND(quantity,4) AS qty,
       ROUND(avg_entry_price,6) AS avg_entry, ROUND(quantity*avg_entry_price,2) AS cost_usd
     FROM portfolio ORDER BY cost_usd DESC LIMIT 20;"
 echo "  (RISK-OFF sells should drain token rows toward 0 and grow ARBITRUM/USDT cash)"
+
+echo; echo "=== [11] v1.3 REALIZED ROUND TRIPS + NEWS GUARD HEALTH ==="
+V13_OK=0
+if [ "$DB_OK" = 1 ]; then
+  V13_OK=$(python3 -c 'import sys,sqlite3
+try:
+    sqlite3.connect("file:"+sys.argv[1]+"?mode=ro", uri=True).execute(
+        "SELECT 1 FROM realized_round_trips LIMIT 1")
+    print(1)
+except Exception:
+    print(0)' "$DB" 2>/dev/null || echo 0)
+fi
+if [ "$V13_OK" != 1 ]; then
+  echo "  (realized_round_trips table not present yet - v1.3 not applied, or no exit has fired since deploy)"
+else
+echo "-- empirical Kelly sample (per asset class) --"
+Q "SELECT asset_class, COUNT(*) AS n,
+      ROUND(AVG(CASE WHEN pnl_usd > 0 THEN 1.0 ELSE 0.0 END),3) AS win_rate,
+      ROUND(SUM(pnl_usd),2) AS net_usd,
+      ROUND(AVG(pnl_pct)*100,2) AS avg_pct
+    FROM realized_round_trips
+    GROUP BY asset_class;"
+echo "  (n < MACE_KELLY_MIN_ROUNDS (10) = priors still in force; 0 rows = no exits yet)"
+echo "-- last 10 realized exits --"
+Q "SELECT asset_class, symbol, reason, basis,
+      ROUND(pnl_pct*100,2) || '%' AS pnl_pct, ROUND(pnl_usd,2) AS pnl_usd,
+      closed_at
+    FROM realized_round_trips ORDER BY trip_id DESC LIMIT 10;"
+echo "-- exit reasons, last 48h --"
+Q "SELECT asset_class, reason, COUNT(*) AS trips, ROUND(SUM(pnl_usd),2) AS net_usd
+    FROM realized_round_trips
+    WHERE datetime(closed_at) >= datetime('now','-48 hours')
+    GROUP BY asset_class, reason ORDER BY trips DESC;"
+echo "-- news guard heartbeat (powers the fail-neutral buy gate) --"
+Q "SELECT component, status, last_healthy_at, last_attempt_at,
+      (SUBSTR(detail,1,60)) AS detail
+    FROM component_health;"
+echo "  (gate holds new buys when last_healthy_at is missing or >12h old)"
+echo "-- gate/fee/venue markers in journals, last 48h --"
+NG=$(journalctl -u mace-tradfi-news-guard --since "$WIN" --no-pager 2>/dev/null | grep -c 'News Guard heartbeat')
+GF=$(journalctl -u mace-equities-orchestrator --since "$WIN" --no-pager 2>/dev/null | grep -c 'NEWS GUARD FAIL-NEUTRAL')
+EK=$(journalctl -u mace-crypto-orchestrator --since "$WIN" --no-pager 2>/dev/null | grep -c 'Empirical Kelly stats active')
+LF=$(journalctl -u mace-crypto-orchestrator --since "$WIN" --no-pager 2>/dev/null | grep -c 'taker fee')
+FP=$(journalctl -u mace-crypto-shield --since "$WIN" --no-pager 2>/dev/null | grep -c 'taker fee')
+VV=$(journalctl -u mace-crypto-orchestrator --since "$WIN" --no-pager 2>/dev/null | grep -c 'served by')
+SL=$(journalctl -u mace-crypto-orchestrator --since "$WIN" --no-pager 2>/dev/null | grep -cE 'STALE LEDGER WRITE-DOWN|unpriceable')
+echo "  news-guard heartbeats   : $NG  (>0 in 48h = sensor alive; 0 = still capped/blind)"
+echo "  FAIL-NEUTRAL buy holds  : $GF  (>0 = gate actively holding buys while guard blind)"
+echo "  empirical Kelly active  : $EK  (>0 = stats flowing once n >= 10)"
+echo "  ledger fee lines (orch) : $LF  shield fee lines: $FP  (>0 = fee live on that path)"
+echo "  failover venue lines    : $VV  (>0 = pool rescued fills off primary venue)"
+echo "  stale-ledger activity   : $SL  (write-downs + deferred confirmations)"
+fi  # V13_OK guard
 
 echo; echo "=== [9] VERDICT (48h) ==="
 TOT=$((TSO+CSO))
