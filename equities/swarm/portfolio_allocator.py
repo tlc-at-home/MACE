@@ -149,7 +149,13 @@ def run_portfolio_guardrail():
             # Enforce hard asset-level ceiling constraint (v1.1: capped at kelly_hard_cap)
             allocated_fraction = min(trade["calculated_kelly"], kelly_hard_cap)
             trade["allocated_fraction"] = allocated_fraction
-            trade["target_size_usd"] = total_equity * allocated_fraction
+            # v1.3.2: Alpaca notional orders reject values with more than 2 decimal
+            # places (HTTP 42210000 "notional value must be limited to 2 decimal
+            # places"). Round at the source so every downstream path (direct buys,
+            # TRIM sells, recovery retries, mcp_requested_trades.amount_usd records)
+            # receives a broker-clean number. The normalization pass below already
+            # rounds, but the no-normalization branch (line 158 else) skipped it.
+            trade["target_size_usd"] = round(total_equity * allocated_fraction, 2)
             total_requested_fraction += allocated_fraction
 
         # 3. Portfolio Normalization Pass (The Budget Constraint)

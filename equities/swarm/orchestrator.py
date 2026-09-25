@@ -308,8 +308,19 @@ def submit_direct_market_order(symbol, notional, side):
     """v1.1: Submits a notional market order DIRECTLY to the Alpaca paper API.
     Removes the LLM dispatch layer from order submission - sells previously went
     through a Gemini prompt referencing a tool (mcp_alpaca_close_position) that was
-    never registered, so every liquidation silently failed."""
+    never registered, so every liquidation silently failed.
+    v1.3.2: Alpaca rejects notional values with more than 2 decimal places
+    (HTTP 42210000 "notional value must be limited to 2 decimal places") -
+    equity*fraction sizing routinely produced 4+ decimals. Round defensively
+    here so every caller (initial buys, TRIM sells, recovery retries) is
+    guaranteed a broker-clean payload regardless of upstream rounding."""
     import requests
+    try:
+        notional = round(float(notional), 2)
+    except (TypeError, ValueError):
+        notional = 0.0
+    if notional < 1.0:
+        return {"ok": False, "message": f"ORDER_REJECTED: notional {notional:.2f} below Alpaca $1.00 minimum"}
     api_key = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")
     headers = {
@@ -321,7 +332,7 @@ def submit_direct_market_order(symbol, notional, side):
     url = "https://paper-api.alpaca.markets/v2/orders"
     payload = {
         "symbol": symbol,
-        "notional": str(notional),
+        "notional": f"{notional:.2f}",
         "side": side,
         "type": "market",
         "time_in_force": "day"
@@ -340,7 +351,9 @@ async def execute_direct_buy(run_id, symbol, size_usd):
     mcp_requested_trades and mcp_execution_log truthfully (COMPLETED/FAILED
     plus an execution-log row with tool_name 'direct_alpaca_buy')."""
     try:
-        size_usd = float(size_usd or 0.0)
+        # v1.3.2: round at dispatch so journal lines, mcp_execution_log.arguments
+        # and the broker payload all carry the same broker-clean 2dp notional.
+        size_usd = round(float(size_usd or 0.0), 2)
     except (TypeError, ValueError):
         size_usd = 0.0
     if size_usd <= 0:
@@ -404,6 +417,14 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     def mcp_alpaca_place_stock_order(symbol: str, notional: str, side: str, type: str, time_in_force: str) -> str:
         """Places a stock order on Alpaca."""
         import requests
+        # v1.3.2: same 2dp notional rule as submit_direct_market_order - the agent
+        # path forwards size_usd verbatim, which can carry 4+ decimals.
+        try:
+            notional_val = round(float(notional), 2)
+        except (TypeError, ValueError):
+            return "ORDER_REJECTED: invalid notional value"
+        if notional_val < 1.0:
+            return f"ORDER_REJECTED: notional {notional_val:.2f} below Alpaca $1.00 minimum"
         headers = {
             "APCA-API-KEY-ID": api_key,
             "APCA-API-SECRET-KEY": secret_key,
@@ -413,7 +434,7 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
         url = "https://paper-api.alpaca.markets/v2/orders"
         payload = {
             "symbol": symbol,
-            "notional": str(notional),
+            "notional": f"{notional_val:.2f}",
             "side": side,
             "type": type,
             "time_in_force": time_in_force

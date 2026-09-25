@@ -118,10 +118,17 @@ class AlpacaClient(BrokerClient):
 
     def place_order(self, symbol: str, notional: float, side: str, type: str, time_in_force: str) -> dict:
         self._check_credentials()
+        # v1.3.2: Alpaca rejects notional with >2 decimal places (HTTP 42210000).
+        try:
+            notional = round(float(notional), 2)
+        except (TypeError, ValueError):
+            notional = 0.0
+        if notional < 1.0:
+            raise ValueError(f"notional {notional:.2f} below Alpaca $1.00 minimum")
         url = f"{self.base_url}/v2/orders"
         order_data = {
             "symbol": symbol,
-            "notional": notional,
+            "notional": f"{notional:.2f}",
             "side": side,
             "type": type,
             "time_in_force": time_in_force

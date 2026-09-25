@@ -1,0 +1,111 @@
+diff --git a/brokers/alpaca_client.py b/brokers/alpaca_client.py
+index 221b7a9..e0a0b49 100755
+--- a/brokers/alpaca_client.py
++++ b/brokers/alpaca_client.py
+@@ -118,10 +118,17 @@ class AlpacaClient(BrokerClient):
+ 
+     def place_order(self, symbol: str, notional: float, side: str, type: str, time_in_force: str) -> dict:
+         self._check_credentials()
++        # v1.3.2: Alpaca rejects notional with >2 decimal places (HTTP 42210000).
++        try:
++            notional = round(float(notional), 2)
++        except (TypeError, ValueError):
++            notional = 0.0
++        if notional < 1.0:
++            raise ValueError(f"notional {notional:.2f} below Alpaca $1.00 minimum")
+         url = f"{self.base_url}/v2/orders"
+         order_data = {
+             "symbol": symbol,
+-            "notional": notional,
++            "notional": f"{notional:.2f}",
+             "side": side,
+             "type": type,
+             "time_in_force": time_in_force
+diff --git a/equities/swarm/orchestrator.py b/equities/swarm/orchestrator.py
+index a512718..2d5b63c 100755
+--- a/equities/swarm/orchestrator.py
++++ b/equities/swarm/orchestrator.py
+@@ -308,8 +308,19 @@ def submit_direct_market_order(symbol, notional, side):
+     """v1.1: Submits a notional market order DIRECTLY to the Alpaca paper API.
+     Removes the LLM dispatch layer from order submission - sells previously went
+     through a Gemini prompt referencing a tool (mcp_alpaca_close_position) that was
+-    never registered, so every liquidation silently failed."""
++    never registered, so every liquidation silently failed.
++    v1.3.2: Alpaca rejects notional values with more than 2 decimal places
++    (HTTP 42210000 "notional value must be limited to 2 decimal places") -
++    equity*fraction sizing routinely produced 4+ decimals. Round defensively
++    here so every caller (initial buys, TRIM sells, recovery retries) is
++    guaranteed a broker-clean payload regardless of upstream rounding."""
+     import requests
++    try:
++        notional = round(float(notional), 2)
++    except (TypeError, ValueError):
++        notional = 0.0
++    if notional < 1.0:
++        return {"ok": False, "message": f"ORDER_REJECTED: notional {notional:.2f} below Alpaca $1.00 minimum"}
+     api_key = os.environ.get("ALPACA_API_KEY")
+     secret_key = os.environ.get("ALPACA_SECRET_KEY")
+     headers = {
+@@ -321,7 +332,7 @@ def submit_direct_market_order(symbol, notional, side):
+     url = "https://paper-api.alpaca.markets/v2/orders"
+     payload = {
+         "symbol": symbol,
+-        "notional": str(notional),
++        "notional": f"{notional:.2f}",
+         "side": side,
+         "type": "market",
+         "time_in_force": "day"
+@@ -340,7 +351,9 @@ async def execute_direct_buy(run_id, symbol, size_usd):
+     mcp_requested_trades and mcp_execution_log truthfully (COMPLETED/FAILED
+     plus an execution-log row with tool_name 'direct_alpaca_buy')."""
+     try:
+-        size_usd = float(size_usd or 0.0)
++        # v1.3.2: round at dispatch so journal lines, mcp_execution_log.arguments
++        # and the broker payload all carry the same broker-clean 2dp notional.
++        size_usd = round(float(size_usd or 0.0), 2)
+     except (TypeError, ValueError):
+         size_usd = 0.0
+     if size_usd <= 0:
+@@ -404,6 +417,14 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+     def mcp_alpaca_place_stock_order(symbol: str, notional: str, side: str, type: str, time_in_force: str) -> str:
+         """Places a stock order on Alpaca."""
+         import requests
++        # v1.3.2: same 2dp notional rule as submit_direct_market_order - the agent
++        # path forwards size_usd verbatim, which can carry 4+ decimals.
++        try:
++            notional_val = round(float(notional), 2)
++        except (TypeError, ValueError):
++            return "ORDER_REJECTED: invalid notional value"
++        if notional_val < 1.0:
++            return f"ORDER_REJECTED: notional {notional_val:.2f} below Alpaca $1.00 minimum"
+         headers = {
+             "APCA-API-KEY-ID": api_key,
+             "APCA-API-SECRET-KEY": secret_key,
+@@ -413,7 +434,7 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+         url = "https://paper-api.alpaca.markets/v2/orders"
+         payload = {
+             "symbol": symbol,
+-            "notional": str(notional),
++            "notional": f"{notional_val:.2f}",
+             "side": side,
+             "type": type,
+             "time_in_force": time_in_force
+diff --git a/equities/swarm/portfolio_allocator.py b/equities/swarm/portfolio_allocator.py
+index 5b11cd9..e3ab5c6 100755
+--- a/equities/swarm/portfolio_allocator.py
++++ b/equities/swarm/portfolio_allocator.py
+@@ -149,7 +149,13 @@ def run_portfolio_guardrail():
+             # Enforce hard asset-level ceiling constraint (v1.1: capped at kelly_hard_cap)
+             allocated_fraction = min(trade["calculated_kelly"], kelly_hard_cap)
+             trade["allocated_fraction"] = allocated_fraction
+-            trade["target_size_usd"] = total_equity * allocated_fraction
++            # v1.3.2: Alpaca notional orders reject values with more than 2 decimal
++            # places (HTTP 42210000 "notional value must be limited to 2 decimal
++            # places"). Round at the source so every downstream path (direct buys,
++            # TRIM sells, recovery retries, mcp_requested_trades.amount_usd records)
++            # receives a broker-clean number. The normalization pass below already
++            # rounds, but the no-normalization branch (line 158 else) skipped it.
++            trade["target_size_usd"] = round(total_equity * allocated_fraction, 2)
+             total_requested_fraction += allocated_fraction
+ 
+         # 3. Portfolio Normalization Pass (The Budget Constraint)
