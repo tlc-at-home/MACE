@@ -1,0 +1,144 @@
+diff --git a/equities/swarm/orchestrator.py b/equities/swarm/orchestrator.py
+index 2d5b63c..45856b5 100755
+--- a/equities/swarm/orchestrator.py
++++ b/equities/swarm/orchestrator.py
+@@ -345,6 +345,105 @@ def submit_direct_market_order(symbol, notional, side):
+     except Exception as e:
+         return {"ok": False, "message": str(e)}
+ 
++def alpaca_market_is_open():
++    """v1.3.3: authoritative US market-hours check via the Alpaca paper clock
++    endpoint (GET /v2/clock) - no local ET/DST/holiday calendar math. Returns
++    (market_open, detail): True/False, or None when the check itself failed
++    (detail then carries the error; on success it is the next_open timestamp).
++    FAIL-CLOSED for the buy gate by design: an unverifiable clock holds buys
++    for one sweep, because an off-hours buy only queues at the broker and
++    restacks the same gap on the next sweep. Deliberately the opposite of
++    brokers.AlpacaClient.get_market_hours, which fails OPEN because the risk
++    shield must keep selling."""
++    import requests
++    headers = {
++        "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY"),
++        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY"),
++        "accept": "application/json"
++    }
++    try:
++        resp = requests.get("https://paper-api.alpaca.markets/v2/clock", headers=headers, timeout=10)
++        if resp.status_code == 200:
++            data = resp.json()
++            return bool(data.get("is_open", False)), str(data.get("next_open", "")).strip()
++        return None, f"clock HTTP {resp.status_code}: {resp.text[:120]}"
++    except Exception as e:
++        return None, f"clock request failed: {e}"
++
++def alpaca_open_order_symbols():
++    """v1.3.3: uppercase symbols that already have an OPEN order at the broker
++    (new/held/partially_filled) - one GET /v2/orders?status=open call per
++    sweep. A just-submitted buy can sit unfilled at session edges or on slow
++    symbols; the allocator only sees FILLED positions, so the next sweep
++    would re-buy the same gap and stack duplicates (the same mechanism as the
++    off-hours stacking, just slower). Returns (open_symbols, detail): a set,
++    or None when the check failed (callers proceed in that case - this gate
++    is only consulted while the market is open, where market orders normally
++    fill within seconds)."""
++    import requests
++    headers = {
++        "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY"),
++        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY"),
++        "accept": "application/json"
++    }
++    try:
++        resp = requests.get("https://paper-api.alpaca.markets/v2/orders",
++                            headers=headers, params={"status": "open", "limit": 500}, timeout=10)
++        if resp.status_code == 200:
++            orders = resp.json()
++            if not isinstance(orders, list):
++                return None, f"orders payload not a list: {str(orders)[:120]}"
++            return {str(o.get("symbol", "")).upper() for o in orders if o.get("symbol")}, "ok"
++        return None, f"orders HTTP {resp.status_code}: {resp.text[:120]}"
++    except Exception as e:
++        return None, f"orders request failed: {e}"
++
++def evaluate_buy_gates(approved_trades, market_open, market_detail="", open_symbols=None, orders_detail=""):
++    """v1.3.3: pure decision core for the two buy gates (unit-testable;
++    run_sweep supplies live API results). market_open: True/False/None (None =
++    clock check failed, market_detail then carries the error; otherwise the
++    next_open timestamp). open_symbols: set of uppercase symbols with pending
++    orders, or None when the orders check failed (only reachable with
++    market_open True). Returns (kept_trades, gate_status, log_lines):
++    gate_status is None when nothing was held, else a telemetry-ready reason.
++    Held buys are simply never requested this sweep - the next sweep
++    re-evaluates fresh, so an in-hours signal still buys exactly once. Sells,
++    trims, stop-outs and liquidations are NEVER gated here (news-gate
++    precedent: risk-off must not be delayed, and the risk shield already
++    market-gates its own sells via tradfi_shield)."""
++    n_buys = len(approved_trades)
++    if market_open is None:
++        return [], "MARKET_GATE_UNAVAILABLE", [
++            f"[!] MARKET GATE: clock check failed ({market_detail}) - holding "
++            f"{n_buys} new buy(s) this sweep (fail-closed). Set MACE_MARKET_GATE=off to bypass."
++        ]
++    if not market_open:
++        next_open = f" (next open {market_detail})" if market_detail else ""
++        return [], "SKIPPED_MARKET_CLOSED", [
++            f"[i] MARKET GATE: US market closed{next_open} - holding {n_buys} "
++            f"new buy(s) this sweep; buys resume once the market opens. Sells "
++            f"and risk-off remain live."
++        ]
++    if open_symbols is None:
++        return approved_trades, None, [
++            f"[!] OPEN-ORDER GATE: orders check failed ({orders_detail}) - "
++            f"proceeding without dedup this sweep (market is open; market orders "
++            f"normally fill within seconds)."
++        ]
++    held = [t for t in approved_trades if str(t.get("symbol", "")).upper() in open_symbols]
++    if not held:
++        return approved_trades, None, []
++    kept = [t for t in approved_trades if str(t.get("symbol", "")).upper() not in open_symbols]
++    held_syms = ", ".join(sorted({str(t.get("symbol", "?")) for t in held}))
++    lines = [
++        f"[i] OPEN-ORDER GATE: holding buy(s) for {held_syms} - an order for "
++        f"this symbol is already pending at the broker; buys resume once it "
++        f"fills or is cancelled."
++    ]
++    if not kept:
++        return [], "SKIPPED_OPEN_ORDER_PENDING", lines
++    return kept, None, lines
++
+ async def execute_direct_buy(run_id, symbol, size_usd):
+     """v1.2: submits a market BUY directly to the Alpaca paper API - the exact
+     same payload the Gemini agent's registered tool posted - then settles
+@@ -595,6 +694,33 @@ async def run_sweep(args):
+                 approved_trades = []
+                 execution_status = "FAIL_NEUTRAL_NEWS_GUARD: " + gate_detail
+ 
++        # v1.3.3 fixes 1+2: OFF-HOURS + DUPLICATE BUY GATES (buy-side only).
++        # Production evidence 2026-09-25: an approved ISRG signal fired in the
++        # pre-market (17:59-18:33 AEST = 03:59-04:33 ET). Alpaca ACCEPTS
++        # off-hours submissions, but market orders only queue until the next
++        # open; the position never updates, so every 17-min sweep re-bought
++        # the same ~$940 gap - 3 stacked day-orders in 34 minutes (pre-v1.3.2
++        # the 422 notional rejections had been this path's accidental brake).
++        # Gate 1 holds new buys while the US market is closed (Alpaca clock
++        # API - no local calendar math); gate 2 skips buys whose symbol
++        # already has a pending order at the broker (also covers slow
++        # in-hours fills). Held buys are re-evaluated fresh on the next sweep,
++        # and are never written to mcp_requested_trades, so the recovery loop
++        # stays clean. Sells/trims/stop-outs stay ungated (news-gate
++        # precedent: risk-off is never delayed; the shield already
++        # market-gates its own sells). MACE_MARKET_GATE=off restores legacy.
++        if approved_trades and os.environ.get("MACE_MARKET_GATE", "on").strip().lower() not in ("off", "0", "false"):
++            market_open, market_detail = alpaca_market_is_open()
++            open_symbols, orders_detail = None, ""
++            if market_open:
++                open_symbols, orders_detail = alpaca_open_order_symbols()
++            approved_trades, gate_status, gate_lines = evaluate_buy_gates(
++                approved_trades, market_open, market_detail, open_symbols, orders_detail)
++            for gate_line in gate_lines:
++                print(gate_line)
++            if gate_status:
++                execution_status = gate_status
++
+         # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
+         # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
+         # hatch use only.
