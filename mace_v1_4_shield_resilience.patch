@@ -1,0 +1,1225 @@
+diff --git a/crypto/crypto_shield.py b/crypto/crypto_shield.py
+index 63593c7..051ba11 100755
+--- a/crypto/crypto_shield.py
++++ b/crypto/crypto_shield.py
+@@ -2,6 +2,17 @@
+ """
+ M.A.C.E. Phase 2 Crypto Shield (Dynamic Volatility-Based Trailing Stop-Loss)
+ Enforces trailing stop-losses calculated dynamically from asset volatility.
++
++v1.4 (resilient feeds): live prices route through the shared price_venues
++pool (fresh ccxt instance per venue, kucoin -> binance -> bybit,
++MACE_PRICE_VENUES-tunable) instead of two long-lived exchange sessions. On
++2026-09-27 the long-lived KuCoin session degraded at transport level (empty /
++WAF-style responses) while fresh-instance probes priced the same pairs fine -
++every BEAT/USDT sweep logged "unavailable on KuCoin" and the Binance failover
++raised BadSymbol (BEAT is KuCoin-only), leaving the position blind until a
++manual restart. This pass also ships per-position crash isolation,
++deterministic connection cleanup, a component_health heartbeat, and
++ghost-ticker protection (two-sided quotes required for stop-out pricing).
+ """
+ 
+ import os
+@@ -11,7 +22,7 @@ import asyncio
+ import argparse
+ import logging
+ import sqlite3
+-from datetime import datetime, timedelta
++from datetime import datetime, timedelta, timezone
+ import ccxt
+ import paho.mqtt.client as mqtt_client
+ 
+@@ -23,9 +34,12 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ # and the same taker fee the guardrail virtual ledger now charges. The shield
+ # settles stop-outs via raw SQL that bypasses guardrail, so it must apply the
+ # fee itself or exits would be gross while entries (post-v1.3) are fee-inclusive.
++# v1.4: price_venues joins the import set - the shield's live prices now come
++# from the same multi-venue pool the orchestrator's ledger fills use.
+ if BASE_DIR not in sys.path:
+     sys.path.insert(0, BASE_DIR)
+ import realized_round_trips as rrt
++import price_venues as price_pool
+ 
+ TAKER_FEE = float(os.getenv("MACE_TAKER_FEE", "0.001"))
+ 
+@@ -50,6 +64,14 @@ def push_mqtt_telemetry(payload):
+ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+ logger = logging.getLogger("mace.crypto_shield")
+ 
++
++def _utcnow_naive():
++    """v1.4 polish: datetime.utcnow() is deprecated on Python 3.12+; this keeps
++    the exact same contract (naive UTC) so strftime/strptime round-trips with
++    DB timestamps stay bit-compatible."""
++    return datetime.now(timezone.utc).replace(tzinfo=None)
++
++
+ def get_db_connection(db_path=DEFAULT_DB_PATH):
+     os.makedirs(os.path.dirname(db_path), exist_ok=True)
+     abs_db_path = os.path.abspath(db_path)
+@@ -60,29 +82,53 @@ def get_db_connection(db_path=DEFAULT_DB_PATH):
+ 
+ class CryptoShield:
+     def __init__(self):
+-        self.primary_exchange = ccxt.kucoin({'enableRateLimit': True})
+-        self.fallback_exchange = ccxt.binance({'enableRateLimit': True})
+-        logger.info("[*] Autonomous Trailing Defensive Shield Connected. Source: KuCoin")
++        # v1.4: the two long-lived exchange sessions are RETIRED. A single
++        # persistent ccxt.kucoin session degraded at transport level
++        # (empty/WAF-style responses) on 2026-09-27 while fresh-instance
++        # probes priced the same pairs fine; the Binance failover then raised
++        # BadSymbol for KuCoin-only listings (BEAT/USDT), leaving the position
++        # blind until a manual restart. All pricing now goes through the
++        # shared price_venues pool: a FRESH ccxt instance per venue per fetch
++        # (degradation-immune), kucoin -> binance -> bybit rotation,
++        # env-tunable via MACE_PRICE_VENUES.
++        self.venues = price_pool.get_venue_list()
++        logger.info(f"[*] Autonomous Trailing Defensive Shield Connected. Price pool: {', '.join(self.venues)}")
++
++    def _heartbeat(self, status, detail=""):
++        """v1.4: fail-neutral health telemetry (parity with the tradfi news
++        guard / tradfi shield). A feed-blind shield is now visible in
++        component_health instead of only in journal warnings - the BEAT blind
++        windows were discovered by log-reading precisely because nothing else
++        would have surfaced them. Never raises, never gates anything."""
++        try:
++            rrt.write_component_heartbeat("crypto_shield", status, detail)
++        except Exception:
++            pass
+ 
+     async def fetch_live_price(self, pair):
+-            target_pair = pair.replace("_", "/")
+-            try:
+-                ticker = await asyncio.to_thread(self.primary_exchange.fetch_ticker, target_pair)
+-                return float(ticker['last'])
+-            except (ccxt.BadSymbol, ccxt.NetworkError, ccxt.ExchangeError) as e:
+-                try:
+-                    logger.warning(f"[-] Synced feed failed or symbol {target_pair} unavailable on KuCoin ({type(e).__name__}: {e}). Failover routing to Binance...")
+-                    ticker = await asyncio.to_thread(self.fallback_exchange.fetch_ticker, target_pair)
+-                    return float(ticker['last'])
+-                except Exception as backup_error:
+-                    logger.error(f"[!] Critical Error: Ticker lookup failed for {target_pair} across both pools: {backup_error}")
+-                    return None
++        target_pair = pair.replace("_", "/")
++        # v1.4: pool routing (fresh instance per venue - immune to the
++        # long-lived-session degradation) plus a two-sided-quote requirement:
++        # a stop-out must never fire off a ghost ticker (stale last, no live
++        # bid/ask). Total pool failure returns (0.0, None) -> None here ->
++        # the position is skipped this sweep, same contract as before.
++        try:
++            price, venue = await price_pool.fetch_live_price_pool(
++                target_pair, log=logger.info, two_sided=True)
++        except Exception as pool_error:
++            logger.error(f"[!] Price pool exception for {target_pair}: {pool_error}")
++            return None
++        if price and price > 0 and venue is not None:
++            return float(price)
++        logger.error(f"[!] Ticker lookup failed for {target_pair} across all {len(self.venues)} pool venues")
++        return None
+ 
+     async def run_shield_cycle(self):
+         logger.info("[*] Commencing deterministic 15-minute risk trailing sweep...")
+         breach_details = []
+         positions_telemetry = []
+         total_holdings_value = 0.0
++        conn = None
+ 
+         try:
+             conn = get_db_connection()
+@@ -106,7 +152,7 @@ class CryptoShield:
+             if not active_positions:
+                 logger.info("[*] Sweep complete: No active token holdings found in the matrix database ledger.")
+                 telemetry_payload = {
+-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
++                    "timestamp": _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "engine": "crypto_shield",
+                     "status": "MONITORING_ACTIVE",
+                     "usdt_balance": round(usdt_balance, 2),
+@@ -116,7 +162,7 @@ class CryptoShield:
+                     "breaches": []
+                 }
+                 push_mqtt_telemetry(telemetry_payload)
+-                conn.close()
++                self._heartbeat("healthy", "no active positions")
+                 return
+ 
+             for row in active_positions:
+@@ -128,101 +174,111 @@ class CryptoShield:
+                 if not cost_basis or cost_basis <= 0:
+                     continue
+ 
+-                live_price = await self.fetch_live_price(pair)
+-                if live_price is None:
+-                    continue
++                # v1.4: per-position crash isolation (parity with tradfi_shield's
++                # per-symbol guard). The old single big try meant one poisoned
++                # row aborted every REMAINING position's sweep - a stop-out
++                # enforcement gap across the whole book exactly when one symbol
++                # needed watching most.
++                try:
++                    live_price = await self.fetch_live_price(pair)
++                    if live_price is None:
++                        continue
+ 
+-                # Query trailing stop-loss metrics from vw_crypto_risk_corridors view
+-                cursor.execute("SELECT high_water_mark, loss_limit, stop_floor_price FROM vw_crypto_risk_corridors WHERE symbol = ?", (pair,))
+-                hwm_row = cursor.fetchone()
+-                if hwm_row:
+-                    hwm = float(hwm_row["high_water_mark"])
+-                    loss_limit = float(hwm_row["loss_limit"])
+-                    calc_floor = float(hwm_row["stop_floor_price"])
+-                else:
+-                    hwm = max(cost_basis, live_price)
+-                    loss_limit = 0.08
+-                    calc_floor = hwm * (1 - loss_limit)
+-                    now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+-                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
+-                    a_row = cursor.fetchone()
+-                    if a_row:
+-                        asset_id = a_row[0]
+-                        cursor.execute("""
+-                            INSERT OR IGNORE INTO crypto_hwm (asset_id, symbol, high_water_mark, loss_limit, updated_at)
+-                            VALUES (?, ?, ?, ?, ?)
+-                        """, (asset_id, pair, hwm, loss_limit, now_str))
+-                        conn.commit()
++                    # Query trailing stop-loss metrics from vw_crypto_risk_corridors view
++                    cursor.execute("SELECT high_water_mark, loss_limit, stop_floor_price FROM vw_crypto_risk_corridors WHERE symbol = ?", (pair,))
++                    hwm_row = cursor.fetchone()
++                    if hwm_row:
++                        hwm = float(hwm_row["high_water_mark"])
++                        loss_limit = float(hwm_row["loss_limit"])
++                        calc_floor = float(hwm_row["stop_floor_price"])
++                    else:
++                        hwm = max(cost_basis, live_price)
++                        loss_limit = 0.08
++                        calc_floor = hwm * (1 - loss_limit)
++                        now_str = _utcnow_naive().strftime('%Y-%m-%dT%H:%M:%SZ')
++                        cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
++                        a_row = cursor.fetchone()
++                        if a_row:
++                            asset_id = a_row[0]
++                            cursor.execute("""
++                                INSERT OR IGNORE INTO crypto_hwm (asset_id, symbol, high_water_mark, loss_limit, updated_at)
++                                VALUES (?, ?, ?, ?, ?)
++                            """, (asset_id, pair, hwm, loss_limit, now_str))
++                            conn.commit()
+ 
+-                # Compute drawdown metrics relative directly to the Peak High Water Mark
+-                trailing_drawdown_pct = (live_price - hwm) / hwm
+-                floor_price = calc_floor
+-
+-                # Dynamic conditional formatting blocks based on asset scale properties
+-                if live_price < 0.01:
+-                    logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.8f} | Live: ${live_price:.8f} | Floor Target: ${floor_price:.8f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
+-                else:
+-                    logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.4f} | Live: ${live_price:.4f} | Floor Target: ${floor_price:.4f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
+-
+-                # Hard Check: Validate if current asset values breach the trailing peak floor
+-                if trailing_drawdown_pct <= -loss_limit:
+-                    logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
+-
+-                    # v1.3: net of taker fee - entries have been fee-inclusive
+-                    # in the guardrail since v1.3; a gross exit credit would
+-                    # systematically overstate recovered USDT by 0.1% per stop-out.
+-                    usdt_recovered = qty * live_price * (1.0 - TAKER_FEE)
+-                    fee_charged = qty * live_price * TAKER_FEE
++                    # Compute drawdown metrics relative directly to the Peak High Water Mark
++                    trailing_drawdown_pct = (live_price - hwm) / hwm
++                    floor_price = calc_floor
++
++                    # Dynamic conditional formatting blocks based on asset scale properties
+                     if live_price < 0.01:
+-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
++                        logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.8f} | Live: ${live_price:.8f} | Floor Target: ${floor_price:.8f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
+                     else:
+-                        logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
+-
+-                    # v1.3: register the realized round trip (ledger-exact: entry
+-                    # basis = ledger avg_entry_price, exit = live net of fee) so
+-                    # the brains' Kelly stats reflect stop-out outcomes.
+-                    rrt.record_trip(
+-                        asset_class="CRYPTO", symbol=pair, qty=qty,
+-                        entry_price=cost_basis,
+-                        exit_price=live_price * (1.0 - TAKER_FEE),
+-                        reason="STOP_LOSS_BREACH", basis="ledger_exact",
+-                        db_path=DEFAULT_DB_PATH)
+-
+-                    # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
+-                    cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
+-                    a_row = cursor.fetchone()
+-                    if a_row:
+-                        asset_id = a_row[0]
+-                        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+-                        cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+-                        cursor.execute("""
+-                            INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
+-                            VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
+-                        """, (asset_id, pair, now_str, cooldown_until_str))
+-
+-                    # Delete the liquidated position from the portfolio and clear its high-water-mark tracking
+-                    cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
+-                    cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
+-                    cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
+-                    conn.commit()
+-                    current_usdt_balance += usdt_recovered
+-                    breach_details.append(f"{pair} stopped out at trailing floor. 24h Cooldown Lock registered.")
+-                else:
+-                    total_holdings_value += qty * live_price
+-                    positions_telemetry.append({
+-                        "token": token,
+-                        "qty": qty,
+-                        "avg_cost": cost_basis,
+-                        "live_price": live_price,
+-                        "hwm": hwm,
+-                        "loss_limit": loss_limit,
+-                        "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
+-                        "value_usdt": round(qty * live_price, 2)
+-                    })
++                        logger.info(f"[*] Position Check: {pair} | Qty: {qty} | Peak HWM: ${hwm:.4f} | Live: ${live_price:.4f} | Floor Target: ${floor_price:.4f} | Drop from Peak: {trailing_drawdown_pct*100:+.2f}%")
++
++                    # Hard Check: Validate if current asset values breach the trailing peak floor
++                    if trailing_drawdown_pct <= -loss_limit:
++                        logger.warning(f"[!!!] TRAILING STOP-LOSS BREACHED: {pair} dropped {trailing_drawdown_pct*100:.2f}% below peak!")
++
++                        # v1.3: net of taker fee - entries have been fee-inclusive
++                        # in the guardrail since v1.3; a gross exit credit would
++                        # systematically overstate recovered USDT by 0.1% per stop-out.
++                        usdt_recovered = qty * live_price * (1.0 - TAKER_FEE)
++                        fee_charged = qty * live_price * TAKER_FEE
++                        if live_price < 0.01:
++                            logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.8f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
++                        else:
++                            logger.warning(f"[!!!] EXECUTION REFLEX: Liquidating {qty} {token} at ${live_price:.4f} -> Recovering ${usdt_recovered:.2f} USDT (net of ${fee_charged:.2f} taker fee)")
++
++                        # v1.3: register the realized round trip (ledger-exact: entry
++                        # basis = ledger avg_entry_price, exit = live net of fee) so
++                        # the brains' Kelly stats reflect stop-out outcomes.
++                        rrt.record_trip(
++                            asset_class="CRYPTO", symbol=pair, qty=qty,
++                            entry_price=cost_basis,
++                            exit_price=live_price * (1.0 - TAKER_FEE),
++                            reason="STOP_LOSS_BREACH", basis="ledger_exact",
++                            db_path=DEFAULT_DB_PATH)
++
++                        # Register 24-hour Post-Liquidation Cooldown Lock in trade_cooldowns
++                        cursor.execute("SELECT asset_id FROM vw_crypto_universe WHERE symbol = ?", (pair,))
++                        a_row = cursor.fetchone()
++                        if a_row:
++                            asset_id = a_row[0]
++                            now_str = _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ")
++                            cooldown_until_str = (_utcnow_naive() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
++                            cursor.execute("""
++                                INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
++                                VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
++                            """, (asset_id, pair, now_str, cooldown_until_str))
++
++                        # Delete the liquidated position from the portfolio and clear its high-water-mark tracking
++                        cursor.execute("DELETE FROM portfolio WHERE token = ?", (token,))
++                        cursor.execute("DELETE FROM crypto_hwm WHERE symbol = ?", (pair,))
++                        cursor.execute("UPDATE portfolio SET quantity = quantity + ? WHERE token = 'USDT'", (usdt_recovered,))
++                        conn.commit()
++                        current_usdt_balance += usdt_recovered
++                        breach_details.append(f"{pair} stopped out at trailing floor. 24h Cooldown Lock registered.")
++                    else:
++                        total_holdings_value += qty * live_price
++                        positions_telemetry.append({
++                            "token": token,
++                            "qty": qty,
++                            "avg_cost": cost_basis,
++                            "live_price": live_price,
++                            "hwm": hwm,
++                            "loss_limit": loss_limit,
++                            "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
++                            "value_usdt": round(qty * live_price, 2)
++                        })
++
++                except Exception as position_error:
++                    logger.error(f"[!] Position check failed for {pair} (isolated; sweep continues): {position_error}")
++                    continue
+ 
+             total_portfolio_value = current_usdt_balance + total_holdings_value
+             telemetry_payload = {
+-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
++                "timestamp": _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "engine": "crypto_shield",
+                 "status": "MONITORING_ACTIVE",
+                 "usdt_balance": round(current_usdt_balance, 2),
+@@ -232,10 +288,22 @@ class CryptoShield:
+                 "breaches": breach_details
+             }
+             push_mqtt_telemetry(telemetry_payload)
+-            conn.close()
++            self._heartbeat(
++                "healthy",
++                f"positions={len(active_positions)} breaches={len(breach_details)} "
++                f"holdings_usdt={round(total_holdings_value, 2)}")
+ 
+         except Exception as e:
+             logger.error(f"[!] Exception caught inside main Shield trailing execution block: {e}")
++            self._heartbeat("degraded", f"sweep exception: {e}")
++        finally:
++            # v1.4: deterministic cleanup. The old code closed the connection
++            # only on its success paths; any mid-sweep exception leaked it.
++            if conn is not None:
++                try:
++                    conn.close()
++                except Exception:
++                    pass
+ 
+ async def main():
+     shield = CryptoShield()
+diff --git a/hwm_stop_updater.py b/hwm_stop_updater.py
+index 1a21977..79a7dbe 100755
+--- a/hwm_stop_updater.py
++++ b/hwm_stop_updater.py
+@@ -23,6 +23,11 @@ if BASE_DIR not in sys.path:
+ 
+ from brokers import get_client_by_name
+ 
++# v1.4: shared-module imports join (repo root is on sys.path above) - the
++# crypto leg gets venue-pool parity and writes a daemon heartbeat.
++import price_venues as price_pool
++import realized_round_trips as rrt
++
+ DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
+ MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
+ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+@@ -75,7 +80,11 @@ def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050,
+         return max(min_bound, min(float(horizon_volatility), max_bound))
+     except Exception as e:
+         logger.warning(f"[!] Exception calculating volatility stop: {e}")
+-        return min_bound
++        # v1.4: failure-direction fix. Returning min_bound (5-6%) on a compute
++        # exception TIGHTENED the corridor below the documented insufficient-
++        # bars fallback (8%) - the wrong direction for a protective stop: a
++        # broken calculation must widen the corridor, never narrow it.
++        return 0.080
+ 
+ 
+ def calculate_daily_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.120, min_daily_bars=10):
+@@ -322,73 +331,103 @@ async def sync_crypto_positions():
+         if not active_positions:
+             return []
+ 
+-        import ccxt.async_support as ccxt
+-        primary_exchange = ccxt.kucoin({'enableRateLimit': True})
+-        fallback_exchange = ccxt.binance({'enableRateLimit': True})
++        # v1.4: venue-pool parity (was hardcoded kucoin -> binance; BEAT/USDT
++        # is KuCoin-only, so a degraded KuCoin session plus a Binance
++        # BadSymbol failover left the ratchet blind for exactly that pair).
++        # Fresh async instance per venue per pass - the pattern that kept
++        # pricing BEAT while the shield's long-lived session failed - with
++        # per-venue isolation and a deterministic close() on every path
++        # (fixes the exception-path aiohttp leak: close previously ran only
++        # on the happy path at the end of the pass).
++        import ccxt.async_support as async_ccxt
++        venues = price_pool.get_venue_list()
++        exchanges = {}
++        try:
++            for venue in venues:
++                venue_cls = getattr(async_ccxt, venue, None)
++                if venue_cls is not None:
++                    exchanges[venue] = venue_cls({'enableRateLimit': True})
+ 
+-        stored_map = get_stored_hwm_map("crypto_hwm")
++            stored_map = get_stored_hwm_map("crypto_hwm")
+ 
+-        with get_db_connection() as conn:
+-            for pos in active_positions:
+-                token = pos[0]
+-                qty = float(pos[1])
+-                avg_entry = float(pos[2])
+-                pair = f"{token}/USDT"
++            with get_db_connection() as conn:
++                for pos in active_positions:
++                    token = pos[0]
++                    qty = float(pos[1])
++                    avg_entry = float(pos[2])
++                    pair = f"{token}/USDT"
+ 
+-                asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
++                    asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
+ 
+-                live_price = None
+-                bars = []
+-
+-                # Fetch live price & 1m OHLCV bars via KuCoin with Binance fallback
++                    live_price = None
++                    bars = []
++                    first_error = None
++                    served_by = None
++
++                    # Fetch live price & 1m OHLCV bars from the first pool venue
++                    # that serves the pair (per-venue isolation: a BadSymbol on
++                    # binance no longer masks a working kucoin/bybit read).
++                    for venue in venues:
++                        exchange = exchanges.get(venue)
++                        if exchange is None:
++                            continue
++                        try:
++                            ticker = await exchange.fetch_ticker(pair)
++                            live_price = float(ticker['last'])
++                            ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
++                            bars = [{"c": c[4]} for c in ohlcv]
++                            served_by = venue
++                            break
++                        except Exception as e:
++                            if first_error is None:
++                                first_error = f"{type(e).__name__}: {e}"
++                            continue
++
++                    if served_by is not None and served_by != venues[0]:
++                        logger.info(f"[i] {pair} market data served by {served_by} (primary {venues[0]} failed: {first_error})")
++
++                    if live_price is None:
++                        if first_error is not None:
++                            logger.warning(f"[!] Failed fetching crypto market data for {pair} across {len(venues)} venues (first error: {first_error})")
++                        continue
++
++                    # v1.2: track basis for crypto too (1m bars normally return 1440)
++                    vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
++
++                    # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
++                    # for multi-day horizons; the old 3-8% corridor was a noise-band exit
++                    # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
++                    loss_limit = calculate_24h_rolling_volatility_stop(
++                        bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
++                    )
++                    note_vol_basis_change(pair, vol_basis, loss_limit)
++
++                    prev_info = stored_map.get(pair, {})
++                    prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
++                    new_hwm = max(prev_hwm, live_price)
++
++                    update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
++                    floor_price = new_hwm * (1.0 - loss_limit)
++
++                    summary.append({
++                        "asset_class": "CRYPTO",
++                        "asset_id": asset_id,
++                        "symbol": pair,
++                        "live_price": live_price,
++                        "hwm": new_hwm,
++                        "loss_limit_pct": round(loss_limit * 100, 2),
++                        "floor_price": round(floor_price, 2),
++                        "vol_basis": vol_basis
++                    })
++
++        finally:
++            for exchange in exchanges.values():
+                 try:
+-                    ticker = await primary_exchange.fetch_ticker(pair)
+-                    live_price = float(ticker['last'])
+-                    ohlcv = await primary_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+-                    bars = [{"c": c[4]} for c in ohlcv]
+-                except Exception as e:
+-                    try:
+-                        ticker = await fallback_exchange.fetch_ticker(pair)
+-                        live_price = float(ticker['last'])
+-                        ohlcv = await fallback_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+-                        bars = [{"c": c[4]} for c in ohlcv]
+-                    except Exception as fb_err:
+-                        logger.warning(f"[!] Failed fetching crypto market data for {pair}: {fb_err}")
+-
+-                if live_price is None:
+-                    continue
+-
+-                # v1.2: track basis for crypto too (1m bars normally return 1440)
+-                vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
+-
+-                # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
+-                # for multi-day horizons; the old 3-8% corridor was a noise-band exit
+-                # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
+-                loss_limit = calculate_24h_rolling_volatility_stop(
+-                    bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
+-                )
+-                note_vol_basis_change(pair, vol_basis, loss_limit)
+-
+-                prev_info = stored_map.get(pair, {})
+-                prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+-                new_hwm = max(prev_hwm, live_price)
+-
+-                update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
+-                floor_price = new_hwm * (1.0 - loss_limit)
+-
+-                summary.append({
+-                    "asset_class": "CRYPTO",
+-                    "asset_id": asset_id,
+-                    "symbol": pair,
+-                    "live_price": live_price,
+-                    "hwm": new_hwm,
+-                    "loss_limit_pct": round(loss_limit * 100, 2),
+-                    "floor_price": round(floor_price, 2),
+-                    "vol_basis": vol_basis
+-                })
+-
+-        await primary_exchange.close()
+-        await fallback_exchange.close()
++                    maybe = exchange.close()
++                    if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
++                        await maybe
++                except Exception:
++                    pass
+ 
+     except Exception as e:
+         logger.error(f"[!] Crypto positions HWM sync exception: {e}")
+@@ -418,6 +457,17 @@ async def run_update_sweep():
+         "positions": combined_positions
+     })
+ 
++    # v1.4: daemon heartbeat - an hwm_updater outage silently degrades every
++    # trailing stop to static (ratchet frozen, corridors stale); component_health
++    # makes that outage visible to the dashboard instead of discoverable only
++    # by reading the journal. Telemetry-only: nothing gates on this row yet.
++    try:
++        rrt.write_component_heartbeat(
++            "hwm_updater", "healthy",
++            f"active={total_active} tradfi={len(tradfi_summary)} crypto={len(crypto_summary)}")
++    except Exception:
++        pass
++
+ 
+ async def main():
+     parser = argparse.ArgumentParser(description="M.A.C.E. 1-Minute HWM Updater")
+@@ -431,6 +481,10 @@ async def main():
+             await run_update_sweep()
+         except Exception as e:
+             logger.error(f"[!] Exception in HWM update loop: {e}")
++            try:
++                rrt.write_component_heartbeat("hwm_updater", "degraded", f"sweep exception: {e}")
++            except Exception:
++                pass
+ 
+         if not args.daemon:
+             break
+diff --git a/price_venues.py b/price_venues.py
+index 7683dff..4a859ab 100755
+--- a/price_venues.py
++++ b/price_venues.py
+@@ -11,6 +11,11 @@ fills the same resilience, env-tunable via MACE_PRICE_VENUES.
+ Fix 6 reuses the pool as the "is this token priceable at all" oracle for the
+ stale-ledger write-down purge (BEAT/USDT cleanup).
+ 
++v1.4: two_sided=True requires a live bid AND ask before a venue counts as
++serving a pair - the shield's stop-out pricing and the purge oracle opt in,
++so a ghost ticker (stale last, no live quote) can no longer read as
++"priceable" (delisting detection) or drive a protective liquidation.
++
+ Import contract: repo root must be on sys.path (see realized_round_trips.py).
+ Venues are public ticker endpoints - no API keys required. Venue failures are
+ isolated per venue and fall through to the next; total failure returns the
+@@ -29,11 +34,15 @@ def get_venue_list():
+     return venues or [v.strip().lower() for v in DEFAULT_VENUES.split(",")]
+ 
+ 
+-async def fetch_live_price_pool(pair, fallback_price=None, log=None, venue_list=None):
++async def fetch_live_price_pool(pair, fallback_price=None, log=None, venue_list=None, two_sided=False):
+     """Tries each venue in order via ccxt (sync exchange wrapped in a worker
+     thread, mirroring the shield's proven pattern). Returns
+     (price_or_fallback, venue_or_None). Non-primary venue service is logged
+-    when a `log` callable is supplied (orchestrator passes logger.info)."""
++    when a `log` callable is supplied (orchestrator passes logger.info).
++
++    v1.4: two_sided=True additionally requires a live bid AND ask before a
++    venue counts as serving the pair; a last-only ghost ticker is recorded
++    as the first error and the pool falls through to the next venue."""
+     import ccxt
+     venues = venue_list if venue_list is not None else get_venue_list()
+     primary = venues[0] if venues else None
+@@ -47,10 +56,18 @@ async def fetch_live_price_pool(pair, fallback_price=None, log=None, venue_list=
+             exchange = exchange_cls({'enableRateLimit': True})
+             ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
+             last = float(ticker['last'])
+-            if last and last > 0:
++            quote_ok = True
++            if two_sided:
++                bid = float(ticker.get('bid') or 0.0)
++                ask = float(ticker.get('ask') or 0.0)
++                quote_ok = (bid > 0.0 and ask > 0.0)
++            if last and last > 0 and quote_ok:
+                 if log and primary and venue != primary:
+                     log(f"[i] Live price {pair} served by {venue} (primary {primary} failed: {first_err})")
+                 return last, venue
++            if first_err is None:
++                first_err = (f"ghost ticker (last={last}, bid={ticker.get('bid')}, "
++                             f"ask={ticker.get('ask')})")
+         except Exception as e:
+             if first_err is None:
+                 first_err = str(e)
+@@ -67,6 +84,8 @@ async def fetch_live_price_pool(pair, fallback_price=None, log=None, venue_list=
+ 
+ async def price_available_anywhere(pair):
+     """Boolean oracle for the stale-ledger purge: a token that cannot price on
+-    ANY configured venue is a delisting candidate, not a network blip."""
+-    price, venue = await fetch_live_price_pool(pair)
++    ANY configured venue is a delisting candidate, not a network blip.
++    v1.4: requires a two-sided quote - a ghost ticker (stale last, no live
++    bid/ask) no longer certifies a token as priceable."""
++    price, venue = await fetch_live_price_pool(pair, two_sided=True)
+     return (venue is not None)
+diff --git a/realized_round_trips.py b/realized_round_trips.py
+index 5dcae56..2c66399 100755
+--- a/realized_round_trips.py
++++ b/realized_round_trips.py
+@@ -32,6 +32,31 @@ _SCHEMA_OK = set()
+ 
+ KELLY_PRIOR_STRENGTH = 20  # shrinkage k: empirical weight = n / (n + k)
+ 
++# v1.4: empirical payoff guards. The live crypto window hit n=18 / payoff
++# 12.49 (avg win 17.2% vs avg loss 1.4% - trailing-stop asymmetry riding a
++# bull tape, regime luck rather than edge) and the blend DOUBLED sizing vs
++# prior. Two guards: (1) the empirical payoff only participates once n
++# clears the payoff bar (default 30 rounds, MACE_KELLY_PAYOFF_MIN_ROUNDS),
++# and (2) it is clamped to PAYOFF_CLAMP before blending so no small-sample
++# regime artifact can dominate. Win-rate blending is unchanged.
++PAYOFF_CLAMP = (0.5, 3.0)
++PAYOFF_MIN_ROUNDS_DEFAULT = 30
++
++
++def _payoff_min_rounds():
++    try:
++        return max(1, int(os.getenv("MACE_KELLY_PAYOFF_MIN_ROUNDS",
++                                    str(PAYOFF_MIN_ROUNDS_DEFAULT))))
++    except Exception:
++        return PAYOFF_MIN_ROUNDS_DEFAULT
++
++
++def _utcnow_naive():
++    """v1.4 polish: datetime.utcnow() is deprecated on Python 3.12+; keeps
++    the same naive-UTC contract so strptime'd DB timestamps still subtract
++    cleanly (closed_at / last_healthy_at comparisons stay bit-compatible)."""
++    return datetime.now(timezone.utc).replace(tzinfo=None)
++
+ 
+ def ensure_schema(db_path=DEFAULT_DB_PATH):
+     db_path = os.path.abspath(db_path)
+@@ -94,7 +119,7 @@ def record_trip(asset_class, symbol, qty, entry_price, exit_price,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (asset_class, symbol, qty, entry_price, exit_price,
+                  pnl_usd, pnl_pct, reason, basis,
+-                 datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
++                 _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ"))
+             )
+         return True
+     except Exception:
+@@ -154,7 +179,13 @@ def empirical_env_json(asset_class, db_path=DEFAULT_DB_PATH,
+ def blend_with_prior(empirical, prior_win_rate, prior_payoff, k=KELLY_PRIOR_STRENGTH):
+     """Shrinkage blend: w = n / (n + k). k=20 means 20 prior-equivalent
+     observations back the hardcoded priors, so small samples move the
+-    estimate gently and the priors dominate until real history accrues."""
++    estimate gently and the priors dominate until real history accrues.
++
++    v1.4: the empirical payoff only overrides the prior once n >=
++    MACE_KELLY_PAYOFF_MIN_ROUNDS (default 30) AND after clamping to
++    [0.5, 3.0] - payoff is the most small-sample-fragile statistic (one
++    wide win against tight stop-outs can print 10+ and double sizing);
++    win rate keeps its gentle n-bar via the shrinkage weight alone."""
+     n = float(empirical.get("n", 0))
+     if n <= 0:
+         return prior_win_rate, prior_payoff
+@@ -164,8 +195,12 @@ def blend_with_prior(empirical, prior_win_rate, prior_payoff, k=KELLY_PRIOR_STRE
+     emp_po = empirical.get("payoff")
+     if emp_po is None:
+         po = prior_payoff
++    elif n < _payoff_min_rounds():
++        po = prior_payoff
+     else:
+-        po = w * float(emp_po) + (1 - w) * prior_payoff
++        lo, hi = PAYOFF_CLAMP
++        emp_po = min(max(float(emp_po), lo), hi)
++        po = w * emp_po + (1 - w) * prior_payoff
+     return wr, po
+ 
+ 
+@@ -191,7 +226,19 @@ def parse_empirical_env(raw=None):
+ # Fix 1: news-guard heartbeat + fail-neutral buy gate
+ # ----------------------------------------------------------------------------
+ 
+-def write_news_guard_heartbeat(status, detail="", db_path=DEFAULT_DB_PATH,
++def write_component_heartbeat(component, status, detail="", db_path=None):
++    """v1.4: generic component heartbeat - the same upsert the news guard
++    uses, opened to every daemon (crypto_shield, hwm_updater, ...). Pure
++    telemetry: the equities buy gate only consults the news guard's own row,
++    so extra components add dashboard visibility without gating anything.
++    db_path defaults to DEFAULT_DB_PATH at CALL time (test-friendly)."""
++    if db_path is None:
++        db_path = DEFAULT_DB_PATH
++    return write_news_guard_heartbeat(status, detail=detail, db_path=db_path,
++                                      component=component)
++
++
++def write_news_guard_heartbeat(status, detail="", db_path=None,
+                                component="tradfi_news_guard"):
+     """Upserts the guard's health row. `healthy` refreshes last_healthy_at;
+     every other status (degraded / idle) records the attempt only, so the
+@@ -199,7 +246,7 @@ def write_news_guard_heartbeat(status, detail="", db_path=DEFAULT_DB_PATH,
+     sensor has been blind. Never raises."""
+     try:
+         ensure_schema(db_path)
+-        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
++        now_str = _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ")
+         with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
+             conn.execute(
+                 """INSERT INTO component_health (component, last_attempt_at, last_healthy_at, status, detail)
+@@ -242,7 +289,7 @@ def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
+         lh = datetime.strptime(last_healthy, "%Y-%m-%dT%H:%M:%SZ")
+     except Exception:
+         return False, f"unparseable last_healthy_at '{last_healthy}'"
+-    age = (datetime.utcnow() - lh).total_seconds() / 3600.0
++    age = (_utcnow_naive() - lh).total_seconds() / 3600.0
+     if age > staleness_hours:
+         return False, (f"last healthy audit {last_healthy} "
+                        f"({age:.1f}h ago > {staleness_hours:.0f}h staleness window)")
+diff --git a/test_v14_fixes.py b/test_v14_fixes.py
+new file mode 100644
+index 0000000..0562be0
+--- /dev/null
++++ b/test_v14_fixes.py
+@@ -0,0 +1,447 @@
++#!/usr/bin/env python3
++"""v1.4 patch behavioral tests - sandbox-only (scratch DB, stubbed MQTT,
++mocked ccxt - no network, no keys). Portable: drop next to the repo root or
++set MACE_ROOT (mirrors test_v13_fixes.py).
++
++Fix A: shield resilient feeds
++  - live prices route through the price_venues pool with two_sided=True
++  - total pool failure / pool exception -> None (skip position this sweep)
++  - no long-lived ccxt sessions at boot
++  - per-position crash isolation (one poisoned row cannot abort the sweep)
++  - deterministic conn cleanup (finally), degraded-preserving heartbeat
++Fix B: hwm updater venue-pool parity
++  - per-venue isolation + failover, close() on every path (aiohttp-leak fix)
++  - vol-stop compute exception widens to 8% (never tightens to min_bound)
++  - hwm_updater heartbeat row
++Fix C: ghost-ticker hardening
++  - two_sided=True rejects last-only ghosts, default stays last-only
++  - purge oracle requires two-sided quotes
++Fix D: honest-stats guards
++  - empirical payoff n-bar + [0.5, 3.0] clamp in blend_with_prior
++  - generic component heartbeat (call-time db_path)
++Gate : py_compile on every touched file + no datetime.utcnow() left
++"""
++import sys, os, types, sqlite3, asyncio, json, logging, subprocess, tempfile
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++MACE = os.environ.get("MACE_ROOT", "")
++if not MACE:
++    for _cand in (_HERE, os.getcwd(), os.path.dirname(_HERE)):
++        if os.path.isfile(os.path.join(_cand, "crypto", "crypto_shield.py")):
++            MACE = os.path.abspath(_cand)
++            break
++if not MACE:
++    MACE = "/home/z/my-project/mace"
++SCRATCH = os.path.join(_HERE, "scratch_v14.db")
++sys.path.insert(0, MACE)
++sys.path.insert(0, os.path.join(MACE, "crypto"))
++
++PASS, FAIL = [], []
++
++def check(name, cond, detail=""):
++    (PASS if cond else FAIL).append(name)
++    print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  ({detail})" if detail and not cond else ""))
++
++# ---------------------------------------------------------------- stubs -----
++def _stub_module(name, **attrs):
++    mod = types.ModuleType(name)
++    for k, v in attrs.items():
++        setattr(mod, k, v)
++    sys.modules.setdefault(name, mod)
++    return mod
++
++class _CBE:
++    VERSION2 = 2
++class _MC:
++    def __init__(self, *a, **k): pass
++mqtt_client_mod = _stub_module("paho.mqtt.client", CallbackAPIVersion=_CBE, Client=_MC)
++mqtt_pkg = _stub_module("paho.mqtt"); mqtt_pkg.client = mqtt_client_mod
++paho_pkg = _stub_module("paho"); paho_pkg.mqtt = mqtt_pkg
++mqtt_pkg.paho = paho_pkg
++
++# bare ccxt stub - enough for crypto_shield's module-level import; the pool
++# and the hwm leg install their own behavior-rich fakes per test group.
++_ccxt_stub = types.ModuleType("ccxt")
++sys.modules.setdefault("ccxt", _ccxt_stub)
++
++# ---------------------------------------------------------------- setup -----
++import realized_round_trips as rrt
++import price_venues
++import crypto_shield as cs
++import hwm_stop_updater as hwm
++
++if os.path.exists(SCRATCH):
++    os.remove(SCRATCH)
++os.makedirs(os.path.dirname(SCRATCH), exist_ok=True)
++
++SETUP_SQL = os.path.join(MACE, "setup_db.sql")
++
++def fresh_db(run_setup=True):
++    if os.path.exists(SCRATCH):
++        os.remove(SCRATCH)
++    if run_setup:
++        with sqlite3.connect(SCRATCH) as conn:
++            conn.executescript(open(SETUP_SQL).read())
++    rrt._SCHEMA_OK.discard(SCRATCH)
++    rrt.ensure_schema(SCRATCH)
++    return SCRATCH
++
++def q(sql, args=(), db=SCRATCH):
++    with sqlite3.connect(db) as conn:
++        return conn.execute(sql, args).fetchall()
++
++def seed_positional_book():
++    """BTC = healthy corridor (hwm 100), POISON = zero HWM (div-by-zero in the
++    drawdown math) - the isolation trigger."""
++    with sqlite3.connect(SCRATCH) as conn:
++        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('ARBITRUM', 'USDT', 10000.0, 1.0, 0)")
++        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('ARBITRUM', 'BTC', 0.1, 100.0, 0)")
++        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('ARBITRUM', 'POISON', 100.0, 0.5, 0)")
++        conn.execute("""
++            INSERT OR REPLACE INTO crypto_hwm (asset_id, symbol, high_water_mark, loss_limit, updated_at)
++            SELECT asset_id, symbol, 100.0, 0.08, '2026-09-26T00:00:00Z' FROM vw_crypto_universe
++            WHERE symbol IN ('BTC/USDT', 'POISON/USDT')
++        """)
++        conn.execute("UPDATE crypto_hwm SET high_water_mark = 0.0 WHERE symbol = 'POISON/USDT'")
++
++def seed_universe():
++    with sqlite3.connect(SCRATCH) as conn:
++        for sym in ("BTC/USDT", "POISON/USDT"):
++            conn.execute("""
++                INSERT OR IGNORE INTO asset_universe (symbol, asset_class, asset_name, category, broker, exchange, currency)
++                VALUES (?, 'CRYPTO', ?, 'CRYPTO', 'kucoin', 'BINANCE', 'USDT')
++            """, (sym, sym.split("/")[0]))
++
++# route every call-time DB default at the scratch file
++rrt.DEFAULT_DB_PATH = SCRATCH
++cs.DEFAULT_DB_PATH = SCRATCH
++hwm.DB_PATH = SCRATCH
++
++# log capture
++class _Cap(logging.Handler):
++    def __init__(self):
++        super().__init__()
++        self.msgs = []
++    def emit(self, record):
++        self.msgs.append(record.getMessage())
++cap_shield = _Cap(); logging.getLogger("mace.crypto_shield").addHandler(cap_shield)
++cap_hwm = _Cap(); logging.getLogger("mace.hwm_updater").addHandler(cap_hwm)
++
++# =========================================================================
++print("\n--- FIX A: shield resilient feeds ---")
++
++# 1-3: fetch_live_price routes through the pool, two-sided, total-failure safe
++pool_calls = []
++_fake_result = {"value": (0.42, "binance")}
++async def _fake_pool(pair, fallback_price=None, log=None, venue_list=None, two_sided=False):
++    pool_calls.append({"pair": pair, "two_sided": two_sided, "has_log": log is not None})
++    if isinstance(_fake_result["value"], Exception):
++        raise _fake_result["value"]
++    return _fake_result["value"]
++_orig_pool = price_venues.fetch_live_price_pool
++price_venues.fetch_live_price_pool = _fake_pool
++
++shield = cs.CryptoShield()
++px = asyncio.run(shield.fetch_live_price("BEAT_USDT"))
++check("1. fetch routes through venue pool (pair normalized, log wired)",
++      px == 0.42 and pool_calls and pool_calls[-1]["pair"] == "BEAT/USDT" and pool_calls[-1]["has_log"],
++      f"px={px} calls={pool_calls}")
++
++check("2. pool called with two_sided=True (ghost tickers cannot price a stop-out)",
++      pool_calls and pool_calls[-1]["two_sided"] is True, str(pool_calls))
++
++_fake_result["value"] = (0.0, None)
++px = asyncio.run(shield.fetch_live_price("BEAT_USDT"))
++check("3. total pool failure -> None (position skipped this sweep)", px is None, f"px={px}")
++
++_fake_result["value"] = RuntimeError("pool exploded")
++px = asyncio.run(shield.fetch_live_price("BEAT_USDT"))
++check("4. pool exception -> None (belt-and-braces guard)", px is None, f"px={px}")
++_fake_result["value"] = (0.42, "binance")
++
++# 5: no long-lived ccxt sessions at boot
++class _Boom:
++    def __init__(self, *a, **k):
++        raise AssertionError("long-lived exchange session constructed")
++_ccxt_stub.kucoin = _Boom
++_ccxt_stub.binance = _Boom
++try:
++    shield2 = cs.CryptoShield()
++    ok = shield2.venues == ["kucoin", "binance", "bybit"]
++except AssertionError as e:
++    ok = False
++check("5. boot builds no long-lived exchange sessions (pool list only)", ok, str(getattr(shield2, 'venues', None)))
++
++# 6-8: full sweep - isolation, cleanup, heartbeat
++class _ConnProxy:
++    def __init__(self, conn):
++        self._conn = conn
++        self.closed = 0
++    def close(self):
++        self.closed += 1
++        self._conn.close()
++    def __getattr__(self, name):
++        return getattr(self._conn, name)
++
++_close_log = []
++_orig_get_db = cs.get_db_connection
++def _counted_conn(db_path=None):
++    proxy = _ConnProxy(_orig_get_db(SCRATCH))
++    _close_log.append(proxy)
++    return proxy
++cs.get_db_connection = _counted_conn
++
++db = fresh_db(); seed_universe(); seed_positional_book()
++_fake_result["value"] = (99.0, "kucoin")   # above BTC floor (92): no breach
++cap_shield.msgs.clear()
++asyncio.run(shield.run_shield_cycle())
++rows = q("SELECT token FROM portfolio WHERE token IN ('BTC','POISON')")
++hb = q("SELECT status, last_healthy_at, detail FROM component_health WHERE component='crypto_shield'")
++isolated = any("Position check failed for POISON/USDT" in m for m in cap_shield.msgs)
++check("6. poisoned HWM row isolated; healthy BTC row survives the sweep",
++      sorted(r[0] for r in rows) == ["BTC", "POISON"] and isolated,
++      f"rows={rows} msgs={[m[:60] for m in cap_shield.msgs]}")
++check("7. sweep closes its DB connection exactly once (finally-cleanup)",
++      len(_close_log) == 1 and _close_log[0].closed == 1,
++      f"conns={len(_close_log)} closed={[p.closed for p in _close_log]}")
++check("8. healthy sweep writes crypto_shield heartbeat (status + detail)",
++      hb and hb[0][0] == "healthy" and hb[0][1] is not None and "positions=2" in (hb[0][2] or ""),
++      str(hb))
++
++# 9: degraded sweep preserves last_healthy_at
++def _dead_conn(db_path=None):
++    raise RuntimeError("database exploded")
++cs.get_db_connection = _dead_conn
++cap_shield.msgs.clear()
++asyncio.run(shield.run_shield_cycle())
++hb2 = q("SELECT status, last_healthy_at FROM component_health WHERE component='crypto_shield'")
++check("9. degraded sweep flips status, preserves last_healthy_at",
++      hb2 and hb2[0][0] == "degraded" and hb2[0][1] == hb[0][1],
++      f"before={hb[0][1] if hb else None} after={hb2[0][1] if hb2 else None}")
++cs.get_db_connection = _counted_conn
++price_venues.fetch_live_price_pool = _orig_pool
++
++# =========================================================================
++print("\n--- FIX B: hwm updater venue-pool parity ---")
++
++# 10-12: async venue pool with per-venue isolation
++def install_fake_async_ccxt(behaviors, closes):
++    fake_async = types.ModuleType("ccxt.async_support")
++    for vname, beh in behaviors.items():
++        def _make(beh=beh, vname=vname):
++            class _Ex:
++                id = vname
++                def __init__(self, opts=None):
++                    self.venue = vname
++                async def fetch_ticker(self, pair):
++                    t = beh.get("ticker")
++                    if isinstance(t, Exception):
++                        raise t
++                    return dict(t)
++                async def fetch_ohlcv(self, pair, timeframe='1m', limit=1440):
++                    o = beh.get("ohlcv")
++                    if isinstance(o, Exception):
++                        raise o
++                    return list(o)
++                async def close(self):
++                    closes.append(vname)
++            _Ex.__name__ = vname
++            return _Ex
++        setattr(fake_async, vname, _make())
++    fake_ccxt = types.ModuleType("ccxt")
++    fake_ccxt.async_support = fake_async
++    sys.modules["ccxt"] = fake_ccxt
++    sys.modules["ccxt.async_support"] = fake_async
++    return fake_async
++
++BARS = [[1700000000 + i * 60, 100.0, 100.0, 100.0, 100.0, 1.0] for i in range(150)]
++
++def seed_crypto_book():
++    with sqlite3.connect(SCRATCH) as conn:
++        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('ARBITRUM', 'USDT', 1000.0, 1.0, 0)")
++        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('ARBITRUM', 'BTC', 0.1, 100.0, 0)")
++
++# 10: primary (kucoin) fails, binance serves -> hwm updated from failover data
++db = fresh_db(); seed_universe(); seed_crypto_book()
++with sqlite3.connect(SCRATCH) as conn:
++    conn.execute("""
++        INSERT OR REPLACE INTO crypto_hwm (asset_id, symbol, high_water_mark, loss_limit, updated_at)
++        SELECT asset_id, symbol, 90.0, 0.10, '2026-09-26T00:00:00Z' FROM vw_crypto_universe WHERE symbol='BTC/USDT'
++    """)
++closes = []
++install_fake_async_ccxt({
++    "kucoin": {"ticker": RuntimeError("kucoin transport degraded")},
++    "binance": {"ticker": {"last": 120.0, "bid": 119.5, "ask": 120.5}, "ohlcv": BARS},
++    "bybit": {"ticker": {"last": 121.0, "bid": 120.5, "ask": 121.5}, "ohlcv": BARS},
++}, closes)
++cap_hwm.msgs.clear()
++summary = asyncio.run(hwm.sync_crypto_positions())
++hwm_row = q("SELECT high_water_mark, loss_limit FROM crypto_hwm WHERE symbol='BTC/USDT'")
++served = any("market data served by binance" in m for m in cap_hwm.msgs)
++check("10. kucoin failure -> failover venue serves; ratchet updates (hwm 90 -> 120)",
++      hwm_row and abs(hwm_row[0][0] - 120.0) < 1e-9 and served,
++      f"hwm={hwm_row} msgs={[m[:70] for m in cap_hwm.msgs]}")
++check("11. every async exchange instance close()d incl. the failed primary (aiohttp-leak fix)",
++      sorted(closes) == ["binance", "bybit", "kucoin"], f"closes={closes}")
++
++# 11b: all venues fail -> no crash, no row change, class name in warning
++closes.clear()
++install_fake_async_ccxt({
++    "kucoin": {"ticker": RuntimeError("kucoin down")},
++    "binance": {"ticker": RuntimeError("binance down")},
++    "bybit": {"ticker": RuntimeError("bybit down")},
++}, closes)
++cap_hwm.msgs.clear()
++summary = asyncio.run(hwm.sync_crypto_positions())
++hwm_row = q("SELECT high_water_mark FROM crypto_hwm WHERE symbol='BTC/USDT'")
++warned = any("Failed fetching crypto market data for BTC/USDT across 3 venues" in m
++             and "RuntimeError" in m for m in cap_hwm.msgs)
++check("11b. all-venues failure isolated per symbol; warning carries class name",
++      warned and abs(hwm_row[0][0] - 120.0) < 1e-9 and sorted(closes) == ["binance", "bybit", "kucoin"],
++      f"closes={closes} msgs={[m[:70] for m in cap_hwm.msgs]}")
++sys.modules.pop("ccxt", None)
++sys.modules.pop("ccxt.async_support", None)
++
++# 12: vol-stop compute exception widens to 8% (was min_bound - wrong direction)
++check("12. vol-stop compute exception -> 8% fallback (never tightens to min_bound)",
++      hwm.calculate_24h_rolling_volatility_stop(None, min_bound=0.060) == 0.080,
++      str(hwm.calculate_24h_rolling_volatility_stop(None, min_bound=0.060)))
++
++# 13: run_update_sweep heartbeat
++async def _fake_tradfi(client):
++    return []
++async def _fake_crypto():
++    return [{"symbol": "BTC/USDT", "vol_basis": "crypto_1m"}]
++_orig_tradfi, _orig_crypto = hwm.sync_tradfi_positions, hwm.sync_crypto_positions
++_orig_client = hwm.get_client_by_name
++hwm.sync_tradfi_positions, hwm.sync_crypto_positions = _fake_tradfi, _fake_crypto
++hwm.get_client_by_name = lambda name: object()
++asyncio.run(hwm.run_update_sweep())
++hb_hwm = q("SELECT status, last_healthy_at, detail FROM component_health WHERE component='hwm_updater'")
++check("13. hwm_updater heartbeat healthy with sweep detail",
++      hb_hwm and hb_hwm[0][0] == "healthy" and hb_hwm[0][1] is not None and "crypto=1" in (hb_hwm[0][2] or ""),
++      str(hb_hwm))
++hwm.sync_tradfi_positions, hwm.sync_crypto_positions = _orig_tradfi, _orig_crypto
++hwm.get_client_by_name = _orig_client
++
++# =========================================================================
++print("\n--- FIX C: ghost-ticker hardening ---")
++
++def install_fake_sync_ccxt(venue_tickers):
++    fake = types.ModuleType("ccxt")
++    for vname, ticker in venue_tickers.items():
++        def _make(ticker=ticker, vname=vname):
++            class _Ex:
++                def __init__(self, opts=None): pass
++                def fetch_ticker(self, pair):
++                    return dict(ticker)
++                def close(self):
++                    return None
++            _Ex.__name__ = vname
++            return _Ex
++        setattr(fake, vname, _make())
++    sys.modules["ccxt"] = fake
++    return fake
++
++GHOST = {"last": 100.0}                                   # stale last, no quote
++TWOSIDED = {"last": 100.0, "bid": 99.5, "ask": 100.5}
++
++install_fake_sync_ccxt({"kucoin": GHOST, "binance": TWOSIDED, "bybit": TWOSIDED})
++px, vn = asyncio.run(price_venues.fetch_live_price_pool("X/USDT", two_sided=True))
++check("14. two_sided=True skips ghost primary, served by two-sided venue",
++      abs(px - 100.0) < 1e-9 and vn == "binance", f"{px}/{vn}")
++
++px, vn = asyncio.run(price_venues.fetch_live_price_pool("X/USDT"))
++check("15. default two_sided=False keeps last-only contract (orchestrator fills)",
++      abs(px - 100.0) < 1e-9 and vn == "kucoin", f"{px}/{vn}")
++
++install_fake_sync_ccxt({"kucoin": GHOST, "binance": dict(GHOST), "bybit": dict(GHOST)})
++ok = not asyncio.run(price_venues.price_available_anywhere("X/USDT"))
++px, vn = asyncio.run(price_venues.fetch_live_price_pool("X/USDT", fallback_price=7.0, two_sided=True))
++check("16. all-ghost pool -> fallback + purge oracle says unpriceable",
++      ok and vn is None and abs(px - 7.0) < 1e-9, f"oracle={ok} {px}/{vn}")
++
++install_fake_sync_ccxt({"kucoin": TWOSIDED, "binance": TWOSIDED, "bybit": TWOSIDED})
++check("17. two-sided ticker -> purge oracle priceable", asyncio.run(price_venues.price_available_anywhere("X/USDT")))
++sys.modules.pop("ccxt", None)
++
++# =========================================================================
++print("\n--- FIX D: honest-stats guards ---")
++
++# 18: below the payoff bar -> prior payoff exact (the live n=18/12.49 case)
++wr, po = rrt.blend_with_prior({"n": 18, "win_rate": 0.532, "payoff": 12.49}, 0.55, 1.20, k=20)
++w18 = 18 / 38
++check("18. n=18 payoff 12.49 -> prior payoff (n-bar holds); wr still blended",
++      abs(po - 1.20) < 1e-12 and abs(wr - (w18 * 0.532 + (1 - w18) * 0.55)) < 1e-12, f"wr={wr} po={po}")
++
++# 19: at/above the bar -> clamped high
++wr, po = rrt.blend_with_prior({"n": 40, "win_rate": 0.35, "payoff": 12.49}, 0.55, 1.20, k=20)
++w40 = 40 / 60
++check("19. n=40 payoff 12.49 -> clamped to 3.0 before blending",
++      abs(po - (w40 * 3.0 + (1 - w40) * 1.20)) < 1e-12, f"po={po}")
++
++# 20: clamped low
++wr, po = rrt.blend_with_prior({"n": 40, "win_rate": 0.35, "payoff": 0.10}, 0.55, 1.20, k=20)
++check("20. n=40 payoff 0.1 -> clamped up to 0.5 before blending",
++      abs(po - (w40 * 0.5 + (1 - w40) * 1.20)) < 1e-12, f"po={po}")
++
++# 21: in-range payoff -> exact v1.3 math (regression parity)
++wr, po = rrt.blend_with_prior({"n": 40, "win_rate": 0.35, "payoff": 1.9}, 0.55, 1.20, k=20)
++check("21. n=40 payoff 1.9 (in range) -> v1.3-exact blend math",
++      abs(wr - (w40 * 0.35 + (1 - w40) * 0.55)) < 1e-12 and abs(po - (w40 * 1.9 + (1 - w40) * 1.20)) < 1e-12,
++      f"wr={wr} po={po}")
++
++# 22: env override honored
++os.environ["MACE_KELLY_PAYOFF_MIN_ROUNDS"] = "5"
++try:
++    w6 = 6 / 26
++    wr, po = rrt.blend_with_prior({"n": 6, "win_rate": 0.30, "payoff": 9.0}, 0.55, 1.20, k=20)
++    check("22. MACE_KELLY_PAYOFF_MIN_ROUNDS env override honored (n=6 participates, clamped)",
++          abs(po - (w6 * 3.0 + (1 - w6) * 1.20)) < 1e-12, f"po={po}")
++finally:
++    os.environ.pop("MACE_KELLY_PAYOFF_MIN_ROUNDS", None)
++
++# 23: generic heartbeat, call-time db_path
++db = fresh_db()
++ok = rrt.write_component_heartbeat("crypto_shield", "healthy", "detail-here")
++row = q("SELECT status, last_healthy_at, detail FROM component_health WHERE component='crypto_shield'")
++check("23. write_component_heartbeat upserts arbitrary component rows",
++      ok and row and row[0][0] == "healthy" and row[0][1] is not None and row[0][2] == "detail-here", str(row))
++
++# 24: both brains consume the guarded blend (no local copies)
++brain_c = open(os.path.join(MACE, "crypto/swarm/brain.py")).read()
++brain_t = open(os.path.join(MACE, "equities/swarm/brain.py")).read()
++check("24. both brains import blend_with_prior from the shared module (guards propagate)",
++      "from realized_round_trips import parse_empirical_env, blend_with_prior" in brain_c
++      and "from realized_round_trips import parse_empirical_env, blend_with_prior" in brain_t)
++
++# =========================================================================
++print("\n--- GATE: compile + deprecation sweep ---")
++
++touched = ["crypto/crypto_shield.py", "hwm_stop_updater.py", "price_venues.py",
++           "realized_round_trips.py", "crypto/swarm/brain.py", "equities/swarm/brain.py"]
++compile_ok = True
++for rel in touched:
++    r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(MACE, rel)],
++                       capture_output=True, text=True)
++    if r.returncode != 0:
++        compile_ok = False
++        print(r.stderr[-300:])
++check("25. py_compile clean on every touched file", compile_ok)
++
++import re as _re
++def _no_docstrings(src):
++    return _re.sub(r'\x22\x22\x22.*?\x22\x22\x22', '', src, flags=_re.S)
++shield_src = _no_docstrings(open(os.path.join(MACE, "crypto/crypto_shield.py")).read())
++rrt_src = _no_docstrings(open(os.path.join(MACE, "realized_round_trips.py")).read())
++check("26. datetime.utcnow() swept from shield + rrt (no deprecation warnings)",
++      "datetime.utcnow()" not in shield_src and "datetime.utcnow()" not in rrt_src)
++
++# =========================================================================
++print(f"\n==================== RESULT: {len(PASS)}/{len(PASS) + len(FAIL)} ====================")
++if FAIL:
++    print("FAILED:")
++    for f in FAIL:
++        print(f"  - {f}")
++    sys.exit(1)
++print("ALL v1.4 CHECKS PASS")

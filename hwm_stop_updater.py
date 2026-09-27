@@ -23,6 +23,11 @@ if BASE_DIR not in sys.path:
 
 from brokers import get_client_by_name
 
+# v1.4: shared-module imports join (repo root is on sys.path above) - the
+# crypto leg gets venue-pool parity and writes a daemon heartbeat.
+import price_venues as price_pool
+import realized_round_trips as rrt
+
 DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -75,7 +80,11 @@ def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050,
         return max(min_bound, min(float(horizon_volatility), max_bound))
     except Exception as e:
         logger.warning(f"[!] Exception calculating volatility stop: {e}")
-        return min_bound
+        # v1.4: failure-direction fix. Returning min_bound (5-6%) on a compute
+        # exception TIGHTENED the corridor below the documented insufficient-
+        # bars fallback (8%) - the wrong direction for a protective stop: a
+        # broken calculation must widen the corridor, never narrow it.
+        return 0.080
 
 
 def calculate_daily_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.120, min_daily_bars=10):
@@ -322,73 +331,103 @@ async def sync_crypto_positions():
         if not active_positions:
             return []
 
-        import ccxt.async_support as ccxt
-        primary_exchange = ccxt.kucoin({'enableRateLimit': True})
-        fallback_exchange = ccxt.binance({'enableRateLimit': True})
+        # v1.4: venue-pool parity (was hardcoded kucoin -> binance; BEAT/USDT
+        # is KuCoin-only, so a degraded KuCoin session plus a Binance
+        # BadSymbol failover left the ratchet blind for exactly that pair).
+        # Fresh async instance per venue per pass - the pattern that kept
+        # pricing BEAT while the shield's long-lived session failed - with
+        # per-venue isolation and a deterministic close() on every path
+        # (fixes the exception-path aiohttp leak: close previously ran only
+        # on the happy path at the end of the pass).
+        import ccxt.async_support as async_ccxt
+        venues = price_pool.get_venue_list()
+        exchanges = {}
+        try:
+            for venue in venues:
+                venue_cls = getattr(async_ccxt, venue, None)
+                if venue_cls is not None:
+                    exchanges[venue] = venue_cls({'enableRateLimit': True})
 
-        stored_map = get_stored_hwm_map("crypto_hwm")
+            stored_map = get_stored_hwm_map("crypto_hwm")
 
-        with get_db_connection() as conn:
-            for pos in active_positions:
-                token = pos[0]
-                qty = float(pos[1])
-                avg_entry = float(pos[2])
-                pair = f"{token}/USDT"
+            with get_db_connection() as conn:
+                for pos in active_positions:
+                    token = pos[0]
+                    qty = float(pos[1])
+                    avg_entry = float(pos[2])
+                    pair = f"{token}/USDT"
 
-                asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
+                    asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
 
-                live_price = None
-                bars = []
+                    live_price = None
+                    bars = []
+                    first_error = None
+                    served_by = None
 
-                # Fetch live price & 1m OHLCV bars via KuCoin with Binance fallback
+                    # Fetch live price & 1m OHLCV bars from the first pool venue
+                    # that serves the pair (per-venue isolation: a BadSymbol on
+                    # binance no longer masks a working kucoin/bybit read).
+                    for venue in venues:
+                        exchange = exchanges.get(venue)
+                        if exchange is None:
+                            continue
+                        try:
+                            ticker = await exchange.fetch_ticker(pair)
+                            live_price = float(ticker['last'])
+                            ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+                            bars = [{"c": c[4]} for c in ohlcv]
+                            served_by = venue
+                            break
+                        except Exception as e:
+                            if first_error is None:
+                                first_error = f"{type(e).__name__}: {e}"
+                            continue
+
+                    if served_by is not None and served_by != venues[0]:
+                        logger.info(f"[i] {pair} market data served by {served_by} (primary {venues[0]} failed: {first_error})")
+
+                    if live_price is None:
+                        if first_error is not None:
+                            logger.warning(f"[!] Failed fetching crypto market data for {pair} across {len(venues)} venues (first error: {first_error})")
+                        continue
+
+                    # v1.2: track basis for crypto too (1m bars normally return 1440)
+                    vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
+
+                    # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
+                    # for multi-day horizons; the old 3-8% corridor was a noise-band exit
+                    # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
+                    loss_limit = calculate_24h_rolling_volatility_stop(
+                        bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
+                    )
+                    note_vol_basis_change(pair, vol_basis, loss_limit)
+
+                    prev_info = stored_map.get(pair, {})
+                    prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+                    new_hwm = max(prev_hwm, live_price)
+
+                    update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
+                    floor_price = new_hwm * (1.0 - loss_limit)
+
+                    summary.append({
+                        "asset_class": "CRYPTO",
+                        "asset_id": asset_id,
+                        "symbol": pair,
+                        "live_price": live_price,
+                        "hwm": new_hwm,
+                        "loss_limit_pct": round(loss_limit * 100, 2),
+                        "floor_price": round(floor_price, 2),
+                        "vol_basis": vol_basis
+                    })
+
+        finally:
+            for exchange in exchanges.values():
                 try:
-                    ticker = await primary_exchange.fetch_ticker(pair)
-                    live_price = float(ticker['last'])
-                    ohlcv = await primary_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
-                    bars = [{"c": c[4]} for c in ohlcv]
-                except Exception as e:
-                    try:
-                        ticker = await fallback_exchange.fetch_ticker(pair)
-                        live_price = float(ticker['last'])
-                        ohlcv = await fallback_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
-                        bars = [{"c": c[4]} for c in ohlcv]
-                    except Exception as fb_err:
-                        logger.warning(f"[!] Failed fetching crypto market data for {pair}: {fb_err}")
-
-                if live_price is None:
-                    continue
-
-                # v1.2: track basis for crypto too (1m bars normally return 1440)
-                vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
-
-                # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
-                # for multi-day horizons; the old 3-8% corridor was a noise-band exit
-                # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
-                loss_limit = calculate_24h_rolling_volatility_stop(
-                    bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
-                )
-                note_vol_basis_change(pair, vol_basis, loss_limit)
-
-                prev_info = stored_map.get(pair, {})
-                prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
-                new_hwm = max(prev_hwm, live_price)
-
-                update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
-                floor_price = new_hwm * (1.0 - loss_limit)
-
-                summary.append({
-                    "asset_class": "CRYPTO",
-                    "asset_id": asset_id,
-                    "symbol": pair,
-                    "live_price": live_price,
-                    "hwm": new_hwm,
-                    "loss_limit_pct": round(loss_limit * 100, 2),
-                    "floor_price": round(floor_price, 2),
-                    "vol_basis": vol_basis
-                })
-
-        await primary_exchange.close()
-        await fallback_exchange.close()
+                    maybe = exchange.close()
+                    if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
+                        await maybe
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.error(f"[!] Crypto positions HWM sync exception: {e}")
@@ -418,6 +457,17 @@ async def run_update_sweep():
         "positions": combined_positions
     })
 
+    # v1.4: daemon heartbeat - an hwm_updater outage silently degrades every
+    # trailing stop to static (ratchet frozen, corridors stale); component_health
+    # makes that outage visible to the dashboard instead of discoverable only
+    # by reading the journal. Telemetry-only: nothing gates on this row yet.
+    try:
+        rrt.write_component_heartbeat(
+            "hwm_updater", "healthy",
+            f"active={total_active} tradfi={len(tradfi_summary)} crypto={len(crypto_summary)}")
+    except Exception:
+        pass
+
 
 async def main():
     parser = argparse.ArgumentParser(description="M.A.C.E. 1-Minute HWM Updater")
@@ -431,6 +481,10 @@ async def main():
             await run_update_sweep()
         except Exception as e:
             logger.error(f"[!] Exception in HWM update loop: {e}")
+            try:
+                rrt.write_component_heartbeat("hwm_updater", "degraded", f"sweep exception: {e}")
+            except Exception:
+                pass
 
         if not args.daemon:
             break

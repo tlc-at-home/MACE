@@ -32,6 +32,31 @@ _SCHEMA_OK = set()
 
 KELLY_PRIOR_STRENGTH = 20  # shrinkage k: empirical weight = n / (n + k)
 
+# v1.4: empirical payoff guards. The live crypto window hit n=18 / payoff
+# 12.49 (avg win 17.2% vs avg loss 1.4% - trailing-stop asymmetry riding a
+# bull tape, regime luck rather than edge) and the blend DOUBLED sizing vs
+# prior. Two guards: (1) the empirical payoff only participates once n
+# clears the payoff bar (default 30 rounds, MACE_KELLY_PAYOFF_MIN_ROUNDS),
+# and (2) it is clamped to PAYOFF_CLAMP before blending so no small-sample
+# regime artifact can dominate. Win-rate blending is unchanged.
+PAYOFF_CLAMP = (0.5, 3.0)
+PAYOFF_MIN_ROUNDS_DEFAULT = 30
+
+
+def _payoff_min_rounds():
+    try:
+        return max(1, int(os.getenv("MACE_KELLY_PAYOFF_MIN_ROUNDS",
+                                    str(PAYOFF_MIN_ROUNDS_DEFAULT))))
+    except Exception:
+        return PAYOFF_MIN_ROUNDS_DEFAULT
+
+
+def _utcnow_naive():
+    """v1.4 polish: datetime.utcnow() is deprecated on Python 3.12+; keeps
+    the same naive-UTC contract so strptime'd DB timestamps still subtract
+    cleanly (closed_at / last_healthy_at comparisons stay bit-compatible)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def ensure_schema(db_path=DEFAULT_DB_PATH):
     db_path = os.path.abspath(db_path)
@@ -94,7 +119,7 @@ def record_trip(asset_class, symbol, qty, entry_price, exit_price,
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (asset_class, symbol, qty, entry_price, exit_price,
                  pnl_usd, pnl_pct, reason, basis,
-                 datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+                 _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ"))
             )
         return True
     except Exception:
@@ -154,7 +179,13 @@ def empirical_env_json(asset_class, db_path=DEFAULT_DB_PATH,
 def blend_with_prior(empirical, prior_win_rate, prior_payoff, k=KELLY_PRIOR_STRENGTH):
     """Shrinkage blend: w = n / (n + k). k=20 means 20 prior-equivalent
     observations back the hardcoded priors, so small samples move the
-    estimate gently and the priors dominate until real history accrues."""
+    estimate gently and the priors dominate until real history accrues.
+
+    v1.4: the empirical payoff only overrides the prior once n >=
+    MACE_KELLY_PAYOFF_MIN_ROUNDS (default 30) AND after clamping to
+    [0.5, 3.0] - payoff is the most small-sample-fragile statistic (one
+    wide win against tight stop-outs can print 10+ and double sizing);
+    win rate keeps its gentle n-bar via the shrinkage weight alone."""
     n = float(empirical.get("n", 0))
     if n <= 0:
         return prior_win_rate, prior_payoff
@@ -164,8 +195,12 @@ def blend_with_prior(empirical, prior_win_rate, prior_payoff, k=KELLY_PRIOR_STRE
     emp_po = empirical.get("payoff")
     if emp_po is None:
         po = prior_payoff
+    elif n < _payoff_min_rounds():
+        po = prior_payoff
     else:
-        po = w * float(emp_po) + (1 - w) * prior_payoff
+        lo, hi = PAYOFF_CLAMP
+        emp_po = min(max(float(emp_po), lo), hi)
+        po = w * emp_po + (1 - w) * prior_payoff
     return wr, po
 
 
@@ -191,7 +226,19 @@ def parse_empirical_env(raw=None):
 # Fix 1: news-guard heartbeat + fail-neutral buy gate
 # ----------------------------------------------------------------------------
 
-def write_news_guard_heartbeat(status, detail="", db_path=DEFAULT_DB_PATH,
+def write_component_heartbeat(component, status, detail="", db_path=None):
+    """v1.4: generic component heartbeat - the same upsert the news guard
+    uses, opened to every daemon (crypto_shield, hwm_updater, ...). Pure
+    telemetry: the equities buy gate only consults the news guard's own row,
+    so extra components add dashboard visibility without gating anything.
+    db_path defaults to DEFAULT_DB_PATH at CALL time (test-friendly)."""
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+    return write_news_guard_heartbeat(status, detail=detail, db_path=db_path,
+                                      component=component)
+
+
+def write_news_guard_heartbeat(status, detail="", db_path=None,
                                component="tradfi_news_guard"):
     """Upserts the guard's health row. `healthy` refreshes last_healthy_at;
     every other status (degraded / idle) records the attempt only, so the
@@ -199,7 +246,7 @@ def write_news_guard_heartbeat(status, detail="", db_path=DEFAULT_DB_PATH,
     sensor has been blind. Never raises."""
     try:
         ensure_schema(db_path)
-        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_str = _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ")
         with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
             conn.execute(
                 """INSERT INTO component_health (component, last_attempt_at, last_healthy_at, status, detail)
@@ -242,7 +289,7 @@ def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
         lh = datetime.strptime(last_healthy, "%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         return False, f"unparseable last_healthy_at '{last_healthy}'"
-    age = (datetime.utcnow() - lh).total_seconds() / 3600.0
+    age = (_utcnow_naive() - lh).total_seconds() / 3600.0
     if age > staleness_hours:
         return False, (f"last healthy audit {last_healthy} "
                        f"({age:.1f}h ago > {staleness_hours:.0f}h staleness window)")
