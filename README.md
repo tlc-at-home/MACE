@@ -6,7 +6,7 @@ The **Momentum Autonomous Cognitive Engine (M.A.C.E.)** is a modular, multi-agen
 
 ## 1. System Architecture Diagram
 
-The diagram below illustrates the decoupled pipeline model of M.A.C.E. v1.4, showcasing the division of labor between data scouts, quantitative brains, portfolio risk managers, multi-venue price pools, and deterministic stop-loss shields.
+The diagram below illustrates the decoupled pipeline model of M.A.C.E. v1.5, showcasing the division of labor between data scouts, quantitative brains, portfolio risk managers, multi-venue price pools, and deterministic stop-loss shields.
 
 ```mermaid
 graph TD
@@ -58,14 +58,22 @@ graph TD
         C_Orch[crypto/swarm/orchestrator.py]
         C_Scout[crypto/swarm/scout.py]
         C_Brain[crypto/swarm/brain.py]
+        C_Alloc[crypto/swarm/portfolio_allocator.py]
         C_Guard[crypto/swarm/guardrail.py]
         C_Shield[crypto/crypto_shield.py]
+        C_News[crypto/crypto_news_guard.py]
         
         C_Orch -->|vw_crypto_universe| C_Scout
         C_Scout -->|Pipe OHLCV via CCXT| C_Brain
-        C_Brain -->|Pipe Signals + Kelly| C_Guard
+        C_Brain -->|Pipe Signals + Kelly| C_Alloc
+        C_Alloc -->|Filter Cooldowns + Trims + Bear Exits| C_Orch
+        C_Orch -->|Sells First + Normalized Buys| C_Guard
         C_Guard -->|Ledger Entries & Exits| DB_Univ
         C_Orch -->|Fills & Mark-to-Market| P_Pool
+        
+        C_News -->|CoinDesk/Cointelegraph RSS + Gemini 2.5| C_Guard
+        C_News -->|Register 24h Lock| DB_Cooldown
+        C_News -->|Heartbeat| DB_Health
         
         C_Shield -->|Two-Sided Live Quotes| P_Pool
         C_Shield -->|Trailing Floor Breach| DB_Univ
@@ -93,6 +101,7 @@ graph TD
     T_News -.->|tradfi_news_guard| MQTT_Broker
     T_Shield -.->|tradfi_shield| MQTT_Broker
     C_Orch -.->|crypto_sword| MQTT_Broker
+    C_News -.->|crypto_news_guard| MQTT_Broker
     C_Shield -.->|crypto_shield| MQTT_Broker
     HWM_Engine -.->|hwm_updater| MQTT_Broker
 ```
@@ -137,16 +146,24 @@ The crypto pipeline operates on a simulated multi-chain sandbox and evaluates as
 2. **Quant Brain ([brain.py](crypto/swarm/brain.py))**:
    - Pure 3-State Gaussian HMM fitted on 2D return/volatility features.
    - Computes shrinkage-blended empirical Kelly fractions for Bull-state candidates using shared math from `realized_round_trips.py`.
-3. **Guardrail / Virtual Ledger ([guardrail.py](crypto/swarm/guardrail.py))**:
+3. **Portfolio Allocator ([portfolio_allocator.py](crypto/swarm/portfolio_allocator.py), v1.5)**:
+   - Modernized to feature parity with the TradFi equities allocator:
+     - **Active Cooldown Filter**: Checks `vw_active_cooldowns` to immediately reject quarantined tokens.
+     - **72h Post-Stopout Probation Gate**: Candidates whose cooldown expired within the last 72 hours must show double conviction (`kelly >= 0.10`) to re-enter, ending mechanical churn loops (e.g. BONK whipsaw).
+     - **Bear-Regime Full Liquidation Orders**: Held tokens flipping to Bear state emit `BEAR_REGIME_LIQUIDATION` sell orders before buy sizing.
+     - **Routine Profit-Taking Trims (`TRIM_PROFIT_TAKING`)**: Audits held positions; emits partial sell orders if a token surges $>15\%$ over its target Kelly dollar weight without triggering cooldown locks.
+     - **Total Equity Kelly Sizing & Budget Normalization**: Sizing calculated against `total_equity`, capped at `KELLY_HARD_CAP` (default 12%), and normalized to 90% deployable liquid cash pool.
+4. **Guardrail / Virtual Ledger ([guardrail.py](crypto/swarm/guardrail.py), v1.5)**:
    - SQLite-backed virtual ledger in `config/portfolio.db` tracking gas balances (Solana, Arbitrum) and active token positions.
    - **Taker Fee Accounting (v1.3)**: Deducts a configurable taker fee (`MACE_TAKER_FEE=0.001`, 0.1%) on all entries (fee-inclusive cost basis) and exits (net USDT recovery).
-   - **Active Cooldown Filter**: Queries `vw_active_cooldowns` to reject quarantined assets.
-   - **Realized Round Trips**: Logs every exit with basis `ledger_exact` to `realized_round_trips`.
-4. **Orchestrator ([orchestrator.py](crypto/swarm/orchestrator.py))**:
+   - **Allocator Sizing Preservation (v1.5)**: `run_piped_risk_gate()` honors pre-computed normalized target dollar sizes from the allocator.
+   - **Realized Round Trips**: Logs every exit with basis `ledger_exact` (including trims with reason `TRIM_PROFIT_TAKING`) to `realized_round_trips`.
+5. **Orchestrator ([orchestrator.py](crypto/swarm/orchestrator.py), v1.5)**:
    - Evaluates universe candidates concurrently with an async semaphore of 10.
+   - **Sells Executed First (v1.5)**: All sell orders (profit-taking trims and Bear liquidations) execute prior to new buys, freeing USDT liquidity and reducing risk exposure.
+   - **Fail-Neutral News Gate (v1.5)**: Holds new buy allocations if the Crypto News Guard heartbeat is degraded or older than 12 hours (`MACE_NEWS_STALENESS_HOURS`). Sells, trims, and stop-outs remain active.
    - **Multi-Venue Pricing Pool (`price_venues.py`, v1.3 / v1.4)**: Live fills mark against KuCoin $\to$ Binance $\to$ Bybit using fresh CCXT instances per fetch.
    - **Stale Ledger Write-Down Purge (v1.3)**: Positions that cannot be priced by any pool venue for 3 consecutive sweeps are written down at $-100\%$ loss to prevent zombie holdings.
-   - **Bear-Regime RISK-OFF Liquidation**: Positions entering Bear state are liquidated and placed on a 24-hour rebuy probation lock.
 
 ---
 
@@ -183,7 +200,14 @@ M.A.C.E. implements four parallel, asynchronous risk mitigation layers to protec
 * **Execution**: Fires `close_position_tool` for immediate liquidation and registers a 24-hour `QUALITATIVE_NEWS_THREAT` cooldown lock.
 * **Heartbeat**: Records audit health in `component_health` to drive the orchestrator's fail-neutral entry gate.
 
-### IV. Rolling Volatility & HWM State Engine ([hwm_stop_updater.py](hwm_stop_updater.py))
+### IV. Qualitative Crypto News Guard ([crypto_news_guard.py](crypto/crypto_news_guard.py), v1.5)
+* **Cadence**: Runs every 4 hours as a systemd service (`mace-crypto-news-guard.service`).
+* **Mechanism**: Multi-source aggregator reading public RSS feeds from CoinDesk, Cointelegraph, and Decrypt, filtering for held crypto tokens and existential threat keywords.
+* **AI Analysis**: Context is evaluated by Gemini 2.5 Flash scanning exclusively for existential crypto risks: smart contract exploits, protocol drain/hacks, stablecoin de-pegging, founder arrests, rug pulls, or emergency exchange delistings.
+* **Execution**: Fires `close_crypto_position_tool` to execute an immediate simulated liquidation against the virtual ledger, registers a 24-hour `QUALITATIVE_NEWS_THREAT` cooldown lock, and purges stale high-water marks.
+* **Heartbeat**: Records audit health in `component_health` to drive the crypto orchestrator's fail-neutral entry gate.
+
+### V. Rolling Volatility & HWM State Engine ([hwm_stop_updater.py](hwm_stop_updater.py))
 * **Cadence**: Runs every 60 seconds as a systemd service.
 * **Calibration Math**:
   - **Equities**: 20-day daily-bar volatility basis, clamped between **5.0% and 12.0%**.
@@ -207,6 +231,7 @@ All services run as background daemons managed by systemd. Real-time structured 
 | `mace-crypto-orchestrator.service` | `crypto/swarm/orchestrator.py` | 4 hours (UTC synchronized) | `mace/telemetry/crypto_sword` |
 | `mace-equities-orchestrator.service` | `equities/swarm/orchestrator.py` | 15 minutes / 1 hour | `mace/telemetry/tradfi_sword` |
 | `mace-tradfi-news-guard.service` | `equities/tradfi_news_guard.py` | 4 hours | `mace/telemetry/tradfi_news_guard` |
+| `mace-crypto-news-guard.service` | `crypto/crypto_news_guard.py` | 4 hours | `mace/telemetry/crypto_news_guard` |
 | `mace-whales-scout.timer` / `.service` | `equities/swarm/whales_scout.py` | Twice daily (US market days) | `mace/telemetry/whales_scout` |
 
 ### Fleet Control Scripts
@@ -289,7 +314,9 @@ All subsystem behaviors are tunable via environment variables in `config/mace.en
 | :--- | :--- | :--- | :--- |
 | `MACE_BUY_DISPATCH` | `direct` | Equities Orchestrator | `direct` = Alpaca REST execution; `agent` = legacy Gemini agent fallback |
 | `MACE_NEWS_GATE` | `on` | Equities Orchestrator | `on` = fail-neutral entry hold when news guard is stale/degraded; `off` = fail-open |
+| `MACE_CRYPTO_NEWS_GATE` | `on` | Crypto Orchestrator | `on` = fail-neutral entry hold when crypto news guard is stale/degraded; `off` = fail-open |
 | `MACE_NEWS_STALENESS_HOURS` | `12` | News Guard Gate | Maximum hours before a news audit is deemed stale |
+| `KELLY_HARD_CAP` | `0.12` | Portfolio Allocators | Maximum single-asset portfolio allocation ceiling (TradFi & Crypto) |
 | `MACE_PRICE_VENUES` | `kucoin,binance,bybit` | Price Pool / Shields | Ordered exchange rotation for crypto pricing and stop-out validation |
 | `MACE_TAKER_FEE` | `0.001` | Virtual Ledger & Shields | Virtual taker fee (0.1%) applied to entries, exits, and stops |
 | `MACE_KELLY_MIN_ROUNDS` | `10` | Quant Brains | Minimum closed exits before empirical stats blend into Kelly priors |
@@ -306,6 +333,12 @@ All subsystem behaviors are tunable via environment variables in `config/mace.en
 
 ## 8. Version History & Milestones
 
+- **v1.5 (Crypto Subsystem Parity & Autonomous Threat Guard)**:
+  - **Modernized Crypto Portfolio Allocator**: 72h post-stopout probation gate (`get_recent_cooldown_expiries`), routine profit-taking trims (`TRIM_PROFIT_TAKING` on $>15\%$ surges), unified `BEAR_REGIME_LIQUIDATION` sell orders, and total-equity Kelly sizing with `KELLY_HARD_CAP` (0.12).
+  - **Orchestrator Execution Sequencing**: Sells dispatched first (trims and Bear liquidations) to free liquidity before buy sweeps; normalized allocator sizing preserved across all execution paths.
+  - **Autonomous Crypto News Guard (`crypto/crypto_news_guard.py`)**: Multi-source public RSS scraper (CoinDesk, Cointelegraph, Decrypt) + Gemini 2.5 Flash qualitative risk agent scanning for existential threats (hacks, exploits, de-pegs, regulatory crackdowns) with emergency simulated liquidation and 24h cooldown locks.
+  - **Fail-Neutral Crypto News Gate**: Crypto orchestrator holds new entries while the crypto news guard is stale or degraded, keeping trims, liquidations, and stops live.
+  - **Fleet & Tooling Integration**: Added `mace-crypto-news-guard.service` to fleet launch/stop scripts (`start_all.sh`, `stop_all.sh`) and dashboard telemetry (`mace_48h_dashboard.sh`).
 - **v1.4 (Shield Resilience & Feed Hardening)**:
   - Multi-venue pricing pool for Crypto Shield and HWM Updater (`price_venues.py`).
   - Fresh CCXT session per call (eliminating long-lived WAF transport degradation).

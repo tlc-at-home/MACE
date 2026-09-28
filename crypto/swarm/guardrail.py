@@ -16,7 +16,7 @@ logger = logging.getLogger("mace.guardrail")
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 
-MAX_SINGLE_ASSET_EXPOSURE = 0.25
+MAX_SINGLE_ASSET_EXPOSURE = float(os.getenv("KELLY_HARD_CAP", "0.12"))
 MIN_TRADE_SIZE_USD = 10.0
 
 # v1.3: virtual-ledger taker fee (default 0.1% = KuCoin spot taker). Pre-v1.3
@@ -32,7 +32,9 @@ try:
 except Exception:
     rrt = None
 
-def get_db_connection(db_path=DEFAULT_DB_PATH):
+def get_db_connection(db_path=None):
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
     conn = sqlite3.connect(abs_db_path, timeout=30.0)
@@ -40,7 +42,9 @@ def get_db_connection(db_path=DEFAULT_DB_PATH):
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db(db_path=DEFAULT_DB_PATH):
+def init_db(db_path=None):
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
 
@@ -166,8 +170,10 @@ def init_db(db_path=DEFAULT_DB_PATH):
     finally:
         conn.close()
 
-def get_wallet_balances_summary():
-    conn = get_db_connection()
+def get_wallet_balances_summary(db_path=None):
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+    conn = get_db_connection(db_path)
     cursor = conn.cursor()
 
     summary = {}
@@ -197,10 +203,12 @@ def get_wallet_balances_summary():
 
     return summary
 
-def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price, reason="LEDGER_SELL"):
+def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price, reason="LEDGER_SELL", db_path=None):
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
     blockchain = "SOLANA" if "SOL" in symbol else "ARBITRUM"
     token = symbol.split("/")[0]
-    conn = get_db_connection()
+    conn = get_db_connection(db_path)
     cursor = conn.cursor()
 
     try:
@@ -313,7 +321,7 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
                     entry_price=entry_basis,
                     exit_price=execution_price * (1.0 - TAKER_FEE),
                     reason=reason, basis="ledger_exact",
-                    db_path=DEFAULT_DB_PATH
+                    db_path=db_path
                 )
 
             logger.info(f"[ledger] SELL {symbol} ${gross_gained:.2f} gross - ${sell_fee_usd:.2f} taker fee @ ${execution_price}")
@@ -339,7 +347,7 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
     finally:
         conn.close()
 
-def run_piped_risk_gate(brain_output_str):
+def run_piped_risk_gate(brain_output_str, db_path=None):
     try:
         signal_data = json.loads(brain_output_str)
     except Exception:
@@ -365,7 +373,9 @@ def run_piped_risk_gate(brain_output_str):
             "reason": "Market regime does not conform to risk-on constraints."
         }
 
-    conn = get_db_connection()
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+    conn = get_db_connection(db_path)
     cursor = conn.cursor()
     try:
         # Check Post-Liquidation Cooldown Lock via vw_active_cooldowns
@@ -393,7 +403,11 @@ def run_piped_risk_gate(brain_output_str):
             total_portfolio_value += (holding["quantity"] * proxy_price)
 
         max_allowed_dollars = total_portfolio_value * MAX_SINGLE_ASSET_EXPOSURE
-        desired_allocation_usd = total_portfolio_value * kelly_f
+        precomputed_target_usd = signal_data.get("target_size_usd")
+        if precomputed_target_usd is not None and float(precomputed_target_usd) > 0:
+            desired_allocation_usd = float(precomputed_target_usd)
+        else:
+            desired_allocation_usd = total_portfolio_value * kelly_f
         effective_cap = min(desired_allocation_usd, max_allowed_dollars, available_usdt)
         target_allocation_usd = max(0.0, effective_cap)
 

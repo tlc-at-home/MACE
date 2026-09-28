@@ -66,11 +66,14 @@ def push_mqtt_telemetry(payload):
     except Exception as e:
         logger.error(f"[!] Asynchronous telemetry network link bottleneck: {e}")
 
+def _utcnow_naive():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def get_seconds_until_next_4h_offset():
     """
     Calculates exact seconds to sleep until the next 4-hour UTC boundary + 5 minutes (e.g., 00:05, 04:05, 08:05).
     """
-    now = datetime.utcnow()
+    now = _utcnow_naive()
 
     # Calculate which 4-hour block we are in (0, 4, 8, 12, 16, 20)
     current_block = (now.hour // 4) * 4
@@ -136,8 +139,8 @@ def register_regime_cooldown(symbol):
             if not row:
                 logger.warning(f"[!] Cannot register regime cooldown for {symbol}: no asset_id in vw_crypto_universe")
                 return
-            now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            cooldown_until_str = (datetime.utcnow() + timedelta(hours=REGIME_COOLDOWN_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_str = _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ")
+            cooldown_until_str = (_utcnow_naive() + timedelta(hours=REGIME_COOLDOWN_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
             cursor.execute(
                 "INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until) VALUES (?, ?, ?, ?, ?)",
                 (row[0], symbol, now_str, "REGIME_RISK_OFF", cooldown_until_str)
@@ -317,21 +320,38 @@ async def execute_swarm_sweep(args):
             "raw_signal": signal
         })
 
-    # Get available cash and existing positions
+    # Get available cash and existing holdings with market values
     conn = sqlite3.connect(DEFAULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT quantity FROM portfolio WHERE blockchain = 'ARBITRUM' AND token = 'USDT'")
     cash_row = cursor.fetchone()
     available_usdt = float(cash_row[0]) if cash_row else 0.0
-    
-    cursor.execute("SELECT token FROM portfolio WHERE token != 'USDT'")
-    existing = [f"{r[0]}/USDT" for r in cursor.fetchall()]
+
+    cursor.execute("SELECT token, quantity, avg_entry_price FROM portfolio WHERE token != 'USDT' AND quantity > 0")
+    held_rows = cursor.fetchall()
     conn.close()
+
+    existing_positions_dict = {}
+    total_positions_val = 0.0
+    for tok, qty, avg_entry in held_rows:
+        pair = f"{tok}/USDT"
+        sig_price = None
+        for cand in candidates:
+            if cand.get("symbol") == pair and cand.get("current_price", 0) > 0:
+                sig_price = float(cand["current_price"])
+                break
+        price = sig_price if sig_price else float(avg_entry)
+        val = round(float(qty) * price, 2)
+        existing_positions_dict[pair] = val
+        total_positions_val += val
+
+    total_equity = round(available_usdt + total_positions_val, 2)
 
     payload = {
         "candidates": candidates,
         "available_cash": available_usdt,
-        "existing_positions": existing
+        "total_equity": total_equity,
+        "existing_positions": existing_positions_dict
     }
 
     allocator_path = os.path.join(BASE_DIR, "crypto/swarm/portfolio_allocator.py")
@@ -353,35 +373,76 @@ async def execute_swarm_sweep(args):
     else:
         alloc_res = json.loads(alloc_stdout.decode().strip())
         approved_trades = alloc_res.get("approved_trades", [])
-        
-        # Execute sells for Bear regime
-        for cand in candidates:
-            if cand["current_state"] == "Bear" and cand["symbol"] in existing:
-                symbol = cand["symbol"]
+        sell_orders = alloc_res.get("sell_orders", [])
+
+        # Fail-neutral news gate check:
+        # If the crypto news guard is stale (>12h) or degraded, new entries are held
+        # while sell, trim, and stop-loss paths remain fully operational.
+        if approved_trades:
+            gate_ok, gate_detail = rrt.news_gate_allows_buys(DEFAULT_DB_PATH, component="crypto_news_guard")
+            if not gate_ok:
+                logger.info(
+                    f"[i] CRYPTO NEWS GUARD FAIL-NEUTRAL: holding {len(approved_trades)} new buy(s) "
+                    f"- {gate_detail}. Sells, trims, and risk-off remain live. "
+                    f"Set MACE_CRYPTO_NEWS_GATE=off to override."
+                )
+                approved_trades = []
+                overall_execution_status = "FAIL_NEUTRAL_NEWS_GUARD: " + gate_detail
+
+        # 1. Execute Sells First (Trims & Bear Liquidations)
+        if sell_orders:
+            balances = guardrail.get_wallet_balances_summary()
+            for s in sell_orders:
+                symbol = s["symbol"]
+                action = s.get("action", "SELL")
                 token_symbol = symbol.split("/")[0]
-                balances = guardrail.get_wallet_balances_summary()
                 held_token = None
                 for chain, chain_data in balances.items():
                     if token_symbol in chain_data.get("tokens", {}):
                         held_token = chain_data["tokens"][token_symbol]
                         break
-                if held_token and held_token["quantity"] > 0:
-                    current_price = await fetch_live_fill_price(symbol, cand.get("current_price", 0.0))
+                if not held_token or held_token["quantity"] <= 0:
+                    continue
+
+                current_price = await fetch_live_fill_price(symbol, 0.0)
+                if current_price <= 0:
+                    logger.warning(f"[!] Cannot execute sell for {symbol}: invalid live fill price")
+                    continue
+
+                if action == "TRIM_PROFIT_TAKING":
+                    trim_usd = float(s.get("trim_amount_usd", 0.0))
+                    trim_qty = min(held_token["quantity"], trim_usd / current_price)
+                    if trim_qty * current_price >= guardrail.MIN_TRADE_SIZE_USD:
+                        ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(
+                            symbol=symbol, action="SELL", quantity=trim_qty,
+                            execution_price=current_price, reason="TRIM_PROFIT_TAKING"
+                        )
+                        if ledger_receipt.get("success"):
+                            logger.info(
+                                f"[+] TRIM PROFIT-TAKING SUCCESS: Trimmed {trim_qty:.4f} {symbol} "
+                                f"(${trim_usd:.2f}) at ${current_price:.2f}"
+                            )
+                            overall_execution_status = "TRIMMED_PROFIT_TAKING"
+                        else:
+                            logger.warning(f"[-] Trim sell failure for {symbol}: {ledger_receipt.get('error')}")
+                else:
+                    # BEAR_REGIME_LIQUIDATION
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(
                         symbol=symbol, action="SELL", quantity=held_token["quantity"],
-                        execution_price=current_price, reason="REGIME_RISK_OFF")
+                        execution_price=current_price, reason="REGIME_RISK_OFF"
+                    )
                     if ledger_receipt.get("success"):
                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
                         register_regime_cooldown(symbol)  # v1.2: block same-token rebuy whipsaw
                         overall_execution_status = "SOLD_BEAR_REGIME"
                     else:
                         overall_execution_status = "SELL_FAILED"
-        
-        # Execute buys
+
+        # 2. Execute Buys Second
         for trade in approved_trades:
             symbol = trade["symbol"]
-            allocated_dollars = trade.get("target_size_usd", 0.0)
-            current_price = trade.get("current_price", 0.0)
+            allocated_dollars = float(trade.get("target_size_usd", 0.0))
+            current_price = float(trade.get("current_price", 0.0))
             
             if trade.get("signal_strength", 0.0) > best_signal_strength:
                 best_signal_strength = trade.get("signal_strength", 0.0)
@@ -396,10 +457,12 @@ async def execute_swarm_sweep(args):
                 overall_execution_status = "INVALID_PRICE"
             else:
                 current_price = await fetch_live_fill_price(symbol, current_price)
-                brain_output_dump = json.dumps(trade["raw_signal"])
-                verdict = guardrail.run_piped_risk_gate(brain_output_dump)
+                trade_signal = dict(trade.get("raw_signal", {}))
+                trade_signal["target_size_usd"] = allocated_dollars
+                trade_signal["current_price"] = current_price
+                verdict = guardrail.run_piped_risk_gate(json.dumps(trade_signal))
                 if verdict.get("status") == "approved":
-                    allocated_dollars = float(verdict.get("allocated_dollars", 0.0))
+                    allocated_dollars = float(verdict.get("allocated_dollars", allocated_dollars))
                     trade_qty = allocated_dollars / current_price
                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="BUY", quantity=trade_qty, execution_price=current_price)
                     if ledger_receipt.get("success"):
@@ -410,9 +473,6 @@ async def execute_swarm_sweep(args):
                         logger.warning(f"[-] Ledger transactional entry failure: {ledger_receipt.get('error')}")
                         overall_execution_status = "REJECTED_BY_LEDGER"
                 else:
-                    # v1.2: surface risk-gate blocks in the journal. Previously these
-                    # were silent, so regime-cooldown rejections were indistinguishable
-                    # from no-ops in telemetry and the BONK whipsaw was invisible.
                     logger.info(f"[i] RISK GATE: BUY {symbol} blocked - {verdict.get('reason', verdict.get('status', 'unknown'))}")
 
     if not top_candidate:

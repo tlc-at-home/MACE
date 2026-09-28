@@ -1,0 +1,15 @@
+[Unit]
+Description=M.A.C.E. Crypto Qualitative News & Threat Guard Agent
+After=network.target
+
+[Service]
+Type=simple
+User=fedora
+WorkingDirectory=/home/fedora/MACE
+EnvironmentFile=/home/fedora/MACE/config/mace.env
+ExecStart=/home/fedora/mace_env/bin/python -u /home/fedora/MACE/crypto/crypto_news_guard.py --daemon --interval 14400
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

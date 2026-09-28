@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# MACE TURNAROUND v1 -- 48H DASHBOARD  (v1.2)
+# MACE TURNAROUND v1 -- 48H DASHBOARD  (v1.5)
+# v1.5 adds: crypto parity monitoring (mace-crypto-news-guard status,
+#   fail-neutral crypto news gate, TRIM_PROFIT_TAKING tracking).
 # v1.2 adds: [11] v1.3 fixes - realized round trips (empirical Kelly sample,
 #   last exits, 48h exit reasons), news-guard heartbeat + fail-neutral gate
 #   markers, taker-fee ledger lines, venue failover lines, stale-ledger
@@ -63,14 +65,14 @@ print("" if (r is None or r[0] is None) else r[0])' "$DB" "$1"
 }
 
 echo "########################################################"
-echo "#  MACE 48H DASHBOARD v1.1  --  $(date -u '+%Y-%m-%dT%H:%MZ')"
+echo "#  MACE 48H DASHBOARD v1.5  --  $(date -u '+%Y-%m-%dT%H:%MZ')"
 echo "########################################################"
 if [ "$DB_OK" = 1 ]; then echo "#  DB: $DB"; else echo "#  !! DB NOT FOUND — DB sections will show n/a"; fi
 
 echo; echo "=== [0] FLEET STATE (context) ==="
 for U in mace-tradfi-shield mace-crypto-shield mace-hwm-updater \
          mace-equities-orchestrator mace-crypto-orchestrator \
-         mace-tradfi-news-guard; do
+         mace-tradfi-news-guard mace-crypto-news-guard; do
   printf "  %-30s %s\n" "$U" "$(systemctl is-active "$U" 2>/dev/null)"
 done
 git -C "$REPO" log -1 --format='  deploy HEAD: %h %s (%ci)' 2>/dev/null
@@ -112,7 +114,7 @@ echo "  48h cooldown rows = $TCD   vs  48h stop-outs = $((TSO+CSO))"
 echo; echo "=== [3] NameError / SHIELD CRASHES  (target: 0) ==="
 NE=0
 for U in mace-tradfi-shield mace-crypto-shield \
-         mace-tradfi-news-guard mace-equities-orchestrator; do
+         mace-tradfi-news-guard mace-crypto-news-guard mace-equities-orchestrator; do
   N=$(journalctl -u "$U" --since "$WIN" --no-pager 2>/dev/null | grep -c 'NameError')
   echo "  $U: NameError count = $N"
   NE=$((NE+N))

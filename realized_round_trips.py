@@ -266,7 +266,7 @@ def write_news_guard_heartbeat(status, detail="", db_path=None,
         return False
 
 
-def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
+def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None, component="tradfi_news_guard"):
     """Returns (healthy, human_detail). Staleness default = 12h = 3x the 4h
     audit cadence (tolerates two consecutive missed audits). Missing table,
     missing row and unparseable timestamps all resolve to NOT healthy - a
@@ -276,15 +276,16 @@ def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
     try:
         with sqlite3.connect(os.path.abspath(db_path), timeout=30.0) as conn:
             row = conn.execute(
-                "SELECT last_healthy_at, status FROM component_health WHERE component = 'tradfi_news_guard'"
+                "SELECT last_healthy_at, status FROM component_health WHERE component = ?",
+                (component,)
             ).fetchone()
     except Exception:
-        return False, "component_health table missing (news guard has never reported)"
+        return False, f"component_health table missing ({component} has never reported)"
     if not row:
-        return False, "no news-guard audit on record"
+        return False, f"no {component} audit on record"
     last_healthy, status = row
     if not last_healthy:
-        return False, f"news guard status={status or 'unknown'}, never completed a healthy audit"
+        return False, f"{component} status={status or 'unknown'}, never completed a healthy audit"
     try:
         lh = datetime.strptime(last_healthy, "%Y-%m-%dT%H:%M:%SZ")
     except Exception:
@@ -296,13 +297,15 @@ def news_guard_is_healthy(db_path=DEFAULT_DB_PATH, staleness_hours=None):
     return True, f"healthy as of {last_healthy} (age {age:.1f}h)"
 
 
-def news_gate_allows_buys(db_path=DEFAULT_DB_PATH):
-    """The orchestrator-side gate decision. MACE_NEWS_GATE=off bypasses the
-    check entirely (legacy fail-open escape hatch). Returns (allowed, detail)."""
-    mode = os.getenv("MACE_NEWS_GATE", "on").strip().lower()
+def news_gate_allows_buys(db_path=DEFAULT_DB_PATH, component="tradfi_news_guard", env_var=None):
+    """The orchestrator-side gate decision. MACE_NEWS_GATE=off (or env_var=off)
+    bypasses the check entirely (legacy fail-open escape hatch). Returns (allowed, detail)."""
+    if env_var is None:
+        env_var = "MACE_CRYPTO_NEWS_GATE" if component == "crypto_news_guard" else "MACE_NEWS_GATE"
+    mode = os.getenv(env_var, "on").strip().lower()
     if mode in ("off", "0", "false", "no"):
-        return True, "news gate disabled via MACE_NEWS_GATE=off (fail-open legacy behavior)"
-    return news_guard_is_healthy(db_path=db_path)
+        return True, f"news gate disabled via {env_var}=off (fail-open legacy behavior)"
+    return news_guard_is_healthy(db_path=db_path, component=component)
 
 
 if __name__ == "__main__":
