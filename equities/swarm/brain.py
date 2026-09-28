@@ -1,8 +1,16 @@
 #!/usr/bin/env python3.11
 import sys
+import os
 import json
 import numpy as np
 import pandas as pd
+
+# v1.3: shared empirical-Kelly helpers live at the repo root (pure stdlib -
+# stats arrive via the MACE_EMPIRICAL_KELLY_JSON env var set by the orchestrator).
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+from realized_round_trips import parse_empirical_env, blend_with_prior
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
 
@@ -85,6 +93,17 @@ def run_brain():
         else:
             win_rate, win_loss_ratio = 0.46, 1.00
 
+        # v1.3: shrinkage blend against realized round trips once the sample
+        # reaches MACE_KELLY_MIN_ROUNDS; priors remain in force until then.
+        empirical = parse_empirical_env()
+        if empirical is not None:
+            win_rate, win_loss_ratio = blend_with_prior(
+                empirical, win_rate, win_loss_ratio,
+                k=empirical.get("prior_strength", 20))
+            kelly_basis = f"empirical n={empirical['n']} wr={win_rate:.3f} po={win_loss_ratio:.2f}"
+        else:
+            kelly_basis = "prior"
+
         loss_rate = 1.0 - win_rate
         theoretical_kelly = win_rate - (loss_rate / win_loss_ratio)
 
@@ -97,7 +116,8 @@ def run_brain():
             "current_state": today_state,
             "signal_strength": round(float(signal_strength), 4),
             "ml_confirmed": bool(is_ml_confirmed),
-            "calculated_kelly": round(float(asset_kelly), 4)
+            "calculated_kelly": round(float(asset_kelly), 4),
+            "kelly_basis": kelly_basis  # v1.3: journal/telemetry transparency
         }
         print(json.dumps(result))
 

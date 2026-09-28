@@ -1,0 +1,10 @@
+=== SUITE ===
+
+==================== RESULT: 40/40 ====================
+ALL v1.3 CHECKS PASS
+=== [2] HEARTBEAT ===
+Sep 23 03:57:36 localhost.localdomain python[2077014]: [2026-09-22 17:57:36,951] INFO - [*] News Guard heartbeat: healthy (verdict=unparsed)
+=== [3] GATE ===
+=== [4] BEAT ===
+=== EXCEPTIONS (expect 0) ===
+0

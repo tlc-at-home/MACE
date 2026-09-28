@@ -3,7 +3,7 @@ import json
 import asyncio
 import os
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from paho.mqtt import client as mqtt_client
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks, policy
@@ -43,6 +43,9 @@ if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 from brokers import get_client_by_name
+
+# v1.3: shared health/round-trip store at repo root (BASE_DIR already on sys.path).
+import realized_round_trips as rrt
 
 # MQTT Broker config
 MQTT_BROKER = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
@@ -250,7 +253,7 @@ class MACEPostToolCallHook(hooks.PostToolCallHook):
             except Exception as e:
                 print(f"[!] Failed to lookup trade_id for {symbol}: {e}")
 
-        status_str = "SUCCESS" if not data.error else "FAILED"
+        status_str = "SUCCESS" if (not data.error and "ORDER_REJECTED" not in str(data.result or "")) else "FAILED"
         try:
             with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute("""
@@ -301,6 +304,203 @@ class MACEToolErrorHook(hooks.OnToolErrorHook):
             print(f"[!] Failed to log tool execution exception: {e}")
         return None
 
+def submit_direct_market_order(symbol, notional, side):
+    """v1.1: Submits a notional market order DIRECTLY to the Alpaca paper API.
+    Removes the LLM dispatch layer from order submission - sells previously went
+    through a Gemini prompt referencing a tool (mcp_alpaca_close_position) that was
+    never registered, so every liquidation silently failed.
+    v1.3.2: Alpaca rejects notional values with more than 2 decimal places
+    (HTTP 42210000 "notional value must be limited to 2 decimal places") -
+    equity*fraction sizing routinely produced 4+ decimals. Round defensively
+    here so every caller (initial buys, TRIM sells, recovery retries) is
+    guaranteed a broker-clean payload regardless of upstream rounding."""
+    import requests
+    try:
+        notional = round(float(notional), 2)
+    except (TypeError, ValueError):
+        notional = 0.0
+    if notional < 1.0:
+        return {"ok": False, "message": f"ORDER_REJECTED: notional {notional:.2f} below Alpaca $1.00 minimum"}
+    api_key = os.environ.get("ALPACA_API_KEY")
+    secret_key = os.environ.get("ALPACA_SECRET_KEY")
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": secret_key,
+        "accept": "application/json",
+        "content-type": "application/json"
+    }
+    url = "https://paper-api.alpaca.markets/v2/orders"
+    payload = {
+        "symbol": symbol,
+        "notional": f"{notional:.2f}",
+        "side": side,
+        "type": "market",
+        "time_in_force": "day"
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code < 400 and '"status":"rejected"' not in resp.text.replace(" ", ""):
+            return {"ok": True, "response": resp.text}
+        return {"ok": False, "message": resp.text[:300]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def alpaca_market_is_open():
+    """v1.3.3: authoritative US market-hours check via the Alpaca paper clock
+    endpoint (GET /v2/clock) - no local ET/DST/holiday calendar math. Returns
+    (market_open, detail): True/False, or None when the check itself failed
+    (detail then carries the error; on success it is the next_open timestamp).
+    FAIL-CLOSED for the buy gate by design: an unverifiable clock holds buys
+    for one sweep, because an off-hours buy only queues at the broker and
+    restacks the same gap on the next sweep. Deliberately the opposite of
+    brokers.AlpacaClient.get_market_hours, which fails OPEN because the risk
+    shield must keep selling."""
+    import requests
+    headers = {
+        "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY"),
+        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY"),
+        "accept": "application/json"
+    }
+    try:
+        resp = requests.get("https://paper-api.alpaca.markets/v2/clock", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return bool(data.get("is_open", False)), str(data.get("next_open", "")).strip()
+        return None, f"clock HTTP {resp.status_code}: {resp.text[:120]}"
+    except Exception as e:
+        return None, f"clock request failed: {e}"
+
+def alpaca_open_order_symbols():
+    """v1.3.3: uppercase symbols that already have an OPEN order at the broker
+    (new/held/partially_filled) - one GET /v2/orders?status=open call per
+    sweep. A just-submitted buy can sit unfilled at session edges or on slow
+    symbols; the allocator only sees FILLED positions, so the next sweep
+    would re-buy the same gap and stack duplicates (the same mechanism as the
+    off-hours stacking, just slower). Returns (open_symbols, detail): a set,
+    or None when the check failed (callers proceed in that case - this gate
+    is only consulted while the market is open, where market orders normally
+    fill within seconds)."""
+    import requests
+    headers = {
+        "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY"),
+        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY"),
+        "accept": "application/json"
+    }
+    try:
+        resp = requests.get("https://paper-api.alpaca.markets/v2/orders",
+                            headers=headers, params={"status": "open", "limit": 500}, timeout=10)
+        if resp.status_code == 200:
+            orders = resp.json()
+            if not isinstance(orders, list):
+                return None, f"orders payload not a list: {str(orders)[:120]}"
+            return {str(o.get("symbol", "")).upper() for o in orders if o.get("symbol")}, "ok"
+        return None, f"orders HTTP {resp.status_code}: {resp.text[:120]}"
+    except Exception as e:
+        return None, f"orders request failed: {e}"
+
+def evaluate_buy_gates(approved_trades, market_open, market_detail="", open_symbols=None, orders_detail=""):
+    """v1.3.3: pure decision core for the two buy gates (unit-testable;
+    run_sweep supplies live API results). market_open: True/False/None (None =
+    clock check failed, market_detail then carries the error; otherwise the
+    next_open timestamp). open_symbols: set of uppercase symbols with pending
+    orders, or None when the orders check failed (only reachable with
+    market_open True). Returns (kept_trades, gate_status, log_lines):
+    gate_status is None when nothing was held, else a telemetry-ready reason.
+    Held buys are simply never requested this sweep - the next sweep
+    re-evaluates fresh, so an in-hours signal still buys exactly once. Sells,
+    trims, stop-outs and liquidations are NEVER gated here (news-gate
+    precedent: risk-off must not be delayed, and the risk shield already
+    market-gates its own sells via tradfi_shield)."""
+    n_buys = len(approved_trades)
+    if market_open is None:
+        return [], "MARKET_GATE_UNAVAILABLE", [
+            f"[!] MARKET GATE: clock check failed ({market_detail}) - holding "
+            f"{n_buys} new buy(s) this sweep (fail-closed). Set MACE_MARKET_GATE=off to bypass."
+        ]
+    if not market_open:
+        next_open = f" (next open {market_detail})" if market_detail else ""
+        return [], "SKIPPED_MARKET_CLOSED", [
+            f"[i] MARKET GATE: US market closed{next_open} - holding {n_buys} "
+            f"new buy(s) this sweep; buys resume once the market opens. Sells "
+            f"and risk-off remain live."
+        ]
+    if open_symbols is None:
+        return approved_trades, None, [
+            f"[!] OPEN-ORDER GATE: orders check failed ({orders_detail}) - "
+            f"proceeding without dedup this sweep (market is open; market orders "
+            f"normally fill within seconds)."
+        ]
+    held = [t for t in approved_trades if str(t.get("symbol", "")).upper() in open_symbols]
+    if not held:
+        return approved_trades, None, []
+    kept = [t for t in approved_trades if str(t.get("symbol", "")).upper() not in open_symbols]
+    held_syms = ", ".join(sorted({str(t.get("symbol", "?")) for t in held}))
+    lines = [
+        f"[i] OPEN-ORDER GATE: holding buy(s) for {held_syms} - an order for "
+        f"this symbol is already pending at the broker; buys resume once it "
+        f"fills or is cancelled."
+    ]
+    if not kept:
+        return [], "SKIPPED_OPEN_ORDER_PENDING", lines
+    return kept, None, lines
+
+async def execute_direct_buy(run_id, symbol, size_usd):
+    """v1.2: submits a market BUY directly to the Alpaca paper API - the exact
+    same payload the Gemini agent's registered tool posted - then settles
+    mcp_requested_trades and mcp_execution_log truthfully (COMPLETED/FAILED
+    plus an execution-log row with tool_name 'direct_alpaca_buy')."""
+    try:
+        # v1.3.2: round at dispatch so journal lines, mcp_execution_log.arguments
+        # and the broker payload all carry the same broker-clean 2dp notional.
+        size_usd = round(float(size_usd or 0.0), 2)
+    except (TypeError, ValueError):
+        size_usd = 0.0
+    if size_usd <= 0:
+        print(f"[!] Direct buy skipped for {symbol}: non-positive size")
+        return False
+
+    receipt = submit_direct_market_order(symbol, size_usd, "buy")
+    ok = bool(receipt.get("ok", False))
+    detail = receipt.get("response") if ok else receipt.get("message")
+    trade_status = "COMPLETED" if ok else "FAILED"
+    if ok:
+        print(f"[+] DIRECT BUY {symbol} ${size_usd:.2f}: submitted to Alpaca paper API")
+    else:
+        print(f"[!] DIRECT BUY {symbol} ${size_usd:.2f} REJECTED: {str(detail)[:200]}")
+
+    now_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT trade_id FROM mcp_requested_trades WHERE run_id = ? AND symbol = ? AND action = 'BUY' AND status = 'PENDING'",
+                (run_id, symbol)
+            )
+            row = cursor.fetchone()
+            trade_id = row[0] if row else None
+            if trade_id:
+                cursor.execute(
+                    "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE trade_id = ?",
+                    (trade_status, now_str, trade_id)
+                )
+            conn.execute(
+                "INSERT INTO mcp_execution_log (run_id, trade_id, timestamp, tool_name, arguments, status, result, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    trade_id,
+                    now_str,
+                    "direct_alpaca_buy",
+                    json.dumps({"symbol": symbol, "notional": size_usd, "side": "buy", "type": "market", "time_in_force": "day"}),
+                    "SUCCESS" if ok else "FAILED",
+                    safe_json_dumps(receipt),
+                    None if ok else str(detail)[:500]
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[!] Direct buy DB settlement failed for {symbol}: {e}")
+    return ok
+
 async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     """Helper function to handle Gemini MCP Agent execution and retries."""
     if not run_id:
@@ -316,6 +516,14 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     def mcp_alpaca_place_stock_order(symbol: str, notional: str, side: str, type: str, time_in_force: str) -> str:
         """Places a stock order on Alpaca."""
         import requests
+        # v1.3.2: same 2dp notional rule as submit_direct_market_order - the agent
+        # path forwards size_usd verbatim, which can carry 4+ decimals.
+        try:
+            notional_val = round(float(notional), 2)
+        except (TypeError, ValueError):
+            return "ORDER_REJECTED: invalid notional value"
+        if notional_val < 1.0:
+            return f"ORDER_REJECTED: notional {notional_val:.2f} below Alpaca $1.00 minimum"
         headers = {
             "APCA-API-KEY-ID": api_key,
             "APCA-API-SECRET-KEY": secret_key,
@@ -325,13 +533,17 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
         url = "https://paper-api.alpaca.markets/v2/orders"
         payload = {
             "symbol": symbol,
-            "notional": str(notional),
+            "notional": f"{notional_val:.2f}",
             "side": side,
             "type": type,
             "time_in_force": time_in_force
         }
         try:
-            resp = requests.post(url, headers=headers, json=payload)
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            # v1.1: surface broker rejections (insufficient buying power, halted
+            # symbols, etc.) so the execution log stops counting them as SUCCESS.
+            if resp.status_code >= 400 or '"status":"rejected"' in resp.text.replace(" ", ""):
+                return f"ORDER_REJECTED: {resp.text[:300]}"
             return resp.text
         except Exception as e:
             return str(e)
@@ -378,6 +590,31 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
     except Exception as e:
         return f"Failed MCP execution: {str(e)}"
 
+def record_equity_sell_trip(symbol, reason, trim_usd=None):
+    """v1.3: records a realized (approximate) round trip for an equities exit.
+    Entry basis and position size come from the live Alpaca position snapshot;
+    exit is the position's current_price at dispatch time (flagged
+    dispatch_approx - market-order fills can slip from it). Never raises."""
+    try:
+        from brokers import get_client_for_symbol
+        client = get_client_for_symbol(symbol)
+        pos = client.get_position(symbol)
+        if not pos:
+            return
+        qty = float(pos.get("qty", 0.0))
+        avg_entry = float(pos.get("avg_entry_price", 0.0))
+        exit_ref = float(pos.get("current_price", 0.0))
+        if qty <= 0 or avg_entry <= 0 or exit_ref <= 0:
+            return
+        if trim_usd is not None:
+            qty = min(qty, trim_usd / exit_ref)
+        rrt.record_trip(
+            asset_class="TRADFI", symbol=symbol, qty=qty,
+            entry_price=avg_entry, exit_price=exit_ref,
+            reason=reason, basis="dispatch_approx", db_path=DEFAULT_DB_PATH)
+    except Exception:
+        pass
+
 async def run_sweep(args):
     symbols = []
     sources = {}
@@ -388,6 +625,18 @@ async def run_sweep(args):
         symbols, sources = load_tradfi_universe(DEFAULT_DB_PATH, args.limit)
 
     print(f"[*] Starting async scanning of {len(symbols)} equities assets...")
+
+    # v1.3 fix 3: hand realized edge stats to the brain subprocesses via env
+    # (scout stdout still pipes into brain stdin unchanged; env is the only
+    # side channel that preserves that contract). None -> priors stay in force.
+    rrt.ensure_schema(DEFAULT_DB_PATH)
+    empirical = rrt.empirical_env_json("TRADFI", db_path=DEFAULT_DB_PATH)
+    if empirical:
+        os.environ["MACE_EMPIRICAL_KELLY_JSON"] = empirical
+        print(f"[i] Empirical Kelly stats active: {empirical}")
+    else:
+        os.environ.pop("MACE_EMPIRICAL_KELLY_JSON", None)
+
 
     sem = asyncio.Semaphore(3)
     tasks = [sem_pipeline(symbol, sources.get(symbol, "static"), sem) for symbol in symbols]
@@ -428,6 +677,68 @@ async def run_sweep(args):
     if is_live_execution:
         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         print(f"[*] Starting live execution run: {run_id}")
+
+        # v1.3 fix 1: FAIL-NEUTRAL news-guard gate. The guard (sole remaining
+        # Gemini consumer, 4h cadence) is blind while its API key sits at the
+        # 429 monthly cap; pre-v1.3 the system silently proceeded as if every
+        # audit had come back clean (fail-open). Neutral posture: NEW entries
+        # are held until a fresh healthy audit lands; sells, trims, stop-outs
+        # and liquidations remain fully live (no gross risk added, existing
+        # risk fully managed). MACE_NEWS_GATE=off restores legacy fail-open.
+        if approved_trades:
+            gate_ok, gate_detail = rrt.news_gate_allows_buys(DEFAULT_DB_PATH)
+            if not gate_ok:
+                print(f"[i] NEWS GUARD FAIL-NEUTRAL: holding {len(approved_trades)} new buy(s) "
+                      f"- {gate_detail}. Sells and risk-off remain live. "
+                      f"Set MACE_NEWS_GATE=off to override.")
+                approved_trades = []
+                execution_status = "FAIL_NEUTRAL_NEWS_GUARD: " + gate_detail
+
+        # v1.3.3 fixes 1+2: OFF-HOURS + DUPLICATE BUY GATES (buy-side only).
+        # Production evidence 2026-09-25: an approved ISRG signal fired in the
+        # pre-market (17:59-18:33 AEST = 03:59-04:33 ET). Alpaca ACCEPTS
+        # off-hours submissions, but market orders only queue until the next
+        # open; the position never updates, so every 17-min sweep re-bought
+        # the same ~$940 gap - 3 stacked day-orders in 34 minutes (pre-v1.3.2
+        # the 422 notional rejections had been this path's accidental brake).
+        # Gate 1 holds new buys while the US market is closed (Alpaca clock
+        # API - no local calendar math); gate 2 skips buys whose symbol
+        # already has a pending order at the broker (also covers slow
+        # in-hours fills). Held buys are re-evaluated fresh on the next sweep,
+        # and are never written to mcp_requested_trades, so the recovery loop
+        # stays clean. Sells/trims/stop-outs stay ungated (news-gate
+        # precedent: risk-off is never delayed; the shield already
+        # market-gates its own sells). MACE_MARKET_GATE=off restores legacy.
+        if approved_trades and os.environ.get("MACE_MARKET_GATE", "on").strip().lower() not in ("off", "0", "false"):
+            market_open, market_detail = alpaca_market_is_open()
+            open_symbols, orders_detail = None, ""
+            if market_open:
+                open_symbols, orders_detail = alpaca_open_order_symbols()
+            approved_trades, gate_status, gate_lines = evaluate_buy_gates(
+                approved_trades, market_open, market_detail, open_symbols, orders_detail)
+            for gate_line in gate_lines:
+                print(gate_line)
+            if gate_status:
+                execution_status = gate_status
+
+        # v1.2: buy dispatch mode. 'direct' (default) submits buys straight to the
+        # Alpaca paper API; 'agent' restores the legacy Gemini dispatch for escape-
+        # hatch use only.
+        buy_dispatch_mode = os.environ.get("MACE_BUY_DISPATCH", "direct").strip().lower()
+
+        # v1.1: expire stale PENDING requests from previous runs (>1h old). A jammed
+        # queue of 3,968 never-resolved rows was observed; stale entries both distort
+        # the trade log and risk surprise-execution if re-dispatched.
+        try:
+            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                cutoff = (datetime.utcnow() - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                conn.execute(
+                    "UPDATE mcp_requested_trades SET status = 'EXPIRED', updated_at = ? WHERE status = 'PENDING' AND updated_at < ?",
+                    (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), cutoff)
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[!] Stale PENDING expiry sweep failed: {e}")
         
         # Log intended trades as 'PENDING'
         try:
@@ -447,21 +758,54 @@ async def run_sweep(args):
             print(f"[!] Failed to log initial trade requests to DB: {e}")
 
         # ==========================================
-        # 1. EXECUTE SELLS FIRST
+        # 1. EXECUTE SELLS FIRST (v1.1: DIRECT BROKER PATH - no LLM dispatch)
+        #    The original prompt told Gemini to call `mcp_alpaca_close_position`, a
+        #    tool that was never registered (only mcp_alpaca_place_stock_order
+        #    exists) - every liquidation silently failed. Sells now execute via the
+        #    same BrokerClient.close_position path the risk shield uses (proven:
+        #    261 shield-driven sell fills vs 0 orchestrator-driven sells in 2 weeks).
         # ==========================================
         if sell_orders:
-            sells_description = "\n".join([f"- {s['symbol']}: {s['reason']}" for s in sell_orders])
-            sell_prompt = (
-                f"You are M.A.C.E. risk manager.\n"
-                f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
-                f"Call the `mcp_alpaca_close_position` tool for each symbol to close the full position."
-            )
-            print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
-            sell_result = await execute_mcp_agent(sell_prompt, "Execute the sell orders now.", run_id)
-            print(f"[+] Sell Order Result: {sell_result}")
+            from brokers import get_client_for_symbol
+            for s in sell_orders:
+                symbol = s["symbol"]
+                action = s.get("action", "SELL")
+                try:
+                    if action == "TRIM_PROFIT_TAKING":
+                        trim_usd = float(s.get("trim_amount_usd", 0.0))
+                        record_equity_sell_trip(symbol, "TRIM_PROFIT_TAKING", trim_usd=trim_usd)  # v1.3
+                        receipt = submit_direct_market_order(symbol, trim_usd, "sell")
+                        ok = receipt.get("ok", False)
+                        print(f"[+] TRIM SELL {symbol} ${trim_usd:.2f}: {'submitted' if ok else 'REJECTED: ' + str(receipt.get('message'))}")
+                    else:
+                        # BEAR_REGIME_LIQUIDATION and any other risk-off sell: full exit
+                        record_equity_sell_trip(symbol, action)  # v1.3
+                        client = get_client_for_symbol(symbol)
+                        await asyncio.to_thread(client.close_position, symbol)
+                        ok = True
+                        print(f"[+] LIQUIDATION SELL {symbol} ({action}): dispatched via BrokerClient.close_position")
+                    try:
+                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                            conn.execute(
+                                "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE run_id = ? AND symbol = ? AND action = 'SELL'",
+                                ("COMPLETED" if ok else "FAILED", datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), run_id, symbol)
+                            )
+                            conn.commit()
+                    except Exception as db_err:
+                        print(f"[!] Sell status DB update failed for {symbol}: {db_err}")
+                except Exception as sell_err:
+                    print(f"[!] DIRECT SELL FAILED for {symbol}: {sell_err}")
 
         # ==========================================
-        # 2. EXECUTE BUYS SECOND
+        # 2. EXECUTE BUYS SECOND (v1.2: DIRECT BROKER PATH)
+        #    Buys previously round-tripped through the Gemini Antigravity agent
+        #    (gemini-2.5-flash). That agent has been dead since the API key hit its
+        #    monthly spending cap - every dispatch returned HTTP 429 after 3 retries
+        #    x exponential backoff ("Failed MCP execution"), observed as 167 FAILED
+        #    and 96 EXPIRED buy rows per 48h with only a handful of lucky completions.
+        #    The agent's registered tool posts the IDENTICAL Alpaca REST payload that
+        #    submit_direct_market_order() sends - the LLM layer added no logic, only
+        #    a failure mode. Set MACE_BUY_DISPATCH=agent to restore the legacy path.
         # ==========================================
         if approved_trades:
             top_asset = approved_trades[0]
@@ -476,18 +820,23 @@ async def run_sweep(args):
                 f"- Symbol: '{t['symbol']}', Size: {t['size_usd']} USD"
                 for t in approved_trades
             ])
-            print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
-            buy_prompt = (
-                f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
-                f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
-                f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
-                f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
-                f"TRADES TO EXECUTE:\n{trades_description}\n\n"
-                f"Execute the tools now."
-            )
 
-            print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
-            execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
+            if buy_dispatch_mode == "agent":
+                print(f"[*] Placing REAL market buy orders via Alpaca MCP Agent for:\n{trades_description}...")
+                buy_prompt = (
+                    f"You are an autonomous trade execution terminal. You must execute trades by calling tools, NOT by writing text.\n"
+                    f"Take the following list of trades and call the `mcp_alpaca_place_stock_order` tool EXACTLY ONCE for each trade.\n"
+                    f"Do NOT output a JSON list or summarize the trades before calling the tools. Just call the tools one after another.\n"
+                    f"Parameters for each tool call: symbol, notional (use the size_usd provided), side: 'buy', type: 'market', time_in_force: 'day'.\n\n"
+                    f"TRADES TO EXECUTE:\n{trades_description}\n\n"
+                    f"Execute the tools now."
+                )
+                print("[*] Handing control to Google Antigravity Agent (Gemini 2.5 Flash)...")
+                execution_status = await execute_mcp_agent(buy_prompt, "Place the approved stock orders via Alpaca MCP.", run_id)
+            else:
+                print(f"[*] Placing REAL market buy orders via direct Alpaca path for:\n{trades_description}...")
+                for t in approved_trades:
+                    await execute_direct_buy(run_id, t["symbol"], float(t["size_usd"]))
 
         # ==========================================
         # 3. RECOVERY LOOP FOR INCOMPLETE TRADES
@@ -515,24 +864,44 @@ async def run_sweep(args):
             retry_sells = [t for t in pending_trades if t[2] == "SELL"]
             retry_buys = [t for t in pending_trades if t[2] == "BUY"]
 
-            recovery_prompt = (
-                f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
-                f"You MUST retry executing only the remaining incomplete orders listed below.\n"
-            )
-            
             if retry_sells:
-                sells_desc = "\n".join([f"- Symbol: '{t[1]}' (Close position)" for t in retry_sells])
-                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `mcp_alpaca_close_position` tool for each symbol."
+                # v1.1: recovery sells go through the direct broker path too
+                from brokers import get_client_for_symbol
+                for t in retry_sells:
+                    try:
+                        record_equity_sell_trip(t[1], "RECOVERY_SELL")  # v1.3
+                        client = get_client_for_symbol(t[1])
+                        await asyncio.to_thread(client.close_position, t[1])
+                        print(f"[+] Recovery LIQUIDATION SELL {t[1]} dispatched via BrokerClient.close_position")
+                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
+                            conn.execute(
+                                "UPDATE mcp_requested_trades SET status = 'COMPLETED', updated_at = ? WHERE trade_id = ?",
+                                (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), t[0])
+                            )
+                            conn.commit()
+                    except Exception as sell_err:
+                        print(f"[!] Recovery sell failed for {t[1]}: {sell_err}")
             
             if retry_buys:
-                buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
-                recovery_prompt += f"\nBUY ORDERS TO RETRY:\n{buys_desc}\nCall `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol."
+                if buy_dispatch_mode == "agent":
+                    buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
+                    recovery_prompt = (
+                        f"You are an autonomous trade execution recovery terminal. The previous execution failed or was half-filled.\n"
+                        f"You MUST retry executing only the remaining incomplete orders listed below.\n"
+                        f"BUY ORDERS TO RETRY:\n{buys_desc}\n"
+                        f"Call `mcp_alpaca_place_stock_order` tool (side='buy', type='market', time_in_force='day', notional=size) for each symbol.\n\n"
+                        f"Execute the recovery tool calls now."
+                    )
+                    print(f"[*] Dispatching recovery attempt {attempt} to agent...")
+                    recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
+                    print(f"[+] Recovery execution status: {recovery_status}")
+                else:
+                    # v1.2: recovery buys take the direct broker path too - the Gemini
+                    # agent is 429-dead, so recovery dispatches only burned another
+                    # 3x retry cycle per pass without executing anything.
+                    for t in retry_buys:
+                        await execute_direct_buy(run_id, t[1], float(t[3]) if t[3] else 0.0)
 
-            recovery_prompt += "\n\nExecute the recovery tool calls now."
-            
-            print(f"[*] Dispatching recovery attempt {attempt} to agent...")
-            recovery_status = await execute_mcp_agent(recovery_prompt, f"Retry the incomplete trades for run {run_id}", run_id)
-            print(f"[+] Recovery execution status: {recovery_status}")
             await asyncio.sleep(5)
 
         # Extract final status summary

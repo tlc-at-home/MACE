@@ -13,7 +13,7 @@ import asyncio
 import argparse
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import paho.mqtt.client as mqtt_client
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -73,65 +73,111 @@ class TradFiShield:
 
             positions = await asyncio.to_thread(primary_client.get_positions)
 
+            held_symbols = set()
             for pos in positions:
-                symbol = pos["symbol"]
-                qty = float(pos["qty"])
-                live_price = float(pos["current_price"])
-                avg_entry = float(pos["avg_entry_price"])
+                symbol = pos.get("symbol")
+                held_symbols.add(symbol)
+                try:
+                    qty = float(pos["qty"])
+                    live_price = float(pos["current_price"])
+                    avg_entry = float(pos["avg_entry_price"])
 
-                symbol_client = get_client_for_symbol(symbol)
+                    symbol_client = get_client_for_symbol(symbol)
 
-                # Fetch tracking parameters calculated straight from historical market noise via view
-                hwm, loss_limit, calc_floor = self.get_position_metrics(symbol)
+                    # Fetch tracking parameters calculated straight from historical market noise via view
+                    hwm, loss_limit, calc_floor = self.get_position_metrics(symbol)
 
-                if not hwm:
-                    hwm = max(avg_entry, live_price)
+                    if not hwm:
+                        hwm = max(avg_entry, live_price)
 
-                trailing_drawdown_pct = (live_price - hwm) / hwm
-                floor_price = calc_floor if calc_floor is not None else hwm * (1 - loss_limit)
+                    trailing_drawdown_pct = (live_price - hwm) / hwm
+                    floor_price = calc_floor if calc_floor is not None else hwm * (1 - loss_limit)
 
-                logger.info(f"[*] [{symbol}] Calibrated Corridor: {loss_limit*100:.2f}% | Peak High: ${hwm:.2f} | Live Price: ${live_price:.2f} | Stop Floor: ${floor_price:.2f} | Delta: {trailing_drawdown_pct*100:+.2f}%")
+                    logger.info(f"[*] [{symbol}] Calibrated Corridor: {loss_limit*100:.2f}% | Peak High: ${hwm:.2f} | Live Price: ${live_price:.2f} | Stop Floor: ${floor_price:.2f} | Delta: {trailing_drawdown_pct*100:+.2f}%")
 
-                if trailing_drawdown_pct <= -loss_limit:
-                    mkt_hours = symbol_client.get_market_hours(symbol)
-                    if not mkt_hours.get("is_open", True):
-                        logger.warning(f"[!] {symbol} threshold breached but market ({mkt_hours.get('exchange')}) is closed. Deferring liquidation.")
-                        continue
+                    if trailing_drawdown_pct <= -loss_limit:
+                        mkt_hours = symbol_client.get_market_hours(symbol)
+                        if not mkt_hours.get("is_open", True):
+                            logger.warning(f"[!] {symbol} threshold breached but market ({mkt_hours.get('exchange')}) is closed. Deferring liquidation.")
+                            continue
 
-                    logger.warning(f"[!!!] CALIBRATED THRESHOLD BREACHED ON {symbol}: Drawdown hit {trailing_drawdown_pct*100:.2f}%")
-                    logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
+                        logger.warning(f"[!!!] CALIBRATED THRESHOLD BREACHED ON {symbol}: Drawdown hit {trailing_drawdown_pct*100:.2f}%")
 
-                    await asyncio.to_thread(symbol_client.close_position, symbol)
+                        # 1) Register the 24h cooldown lock and clear the HWM row BEFORE
+                        #    dispatching the liquidation. If anything downstream faults,
+                        #    the symbol is still protected from an immediate orchestrator
+                        #    rebuy (this ordering + the timedelta import below kill the
+                        #    stop-out -> crash -> rebuy -> stop-out churn loop).
+                        try:
+                            with sqlite3.connect(DEFAULT_DB_PATH) as conn:
+                                conn.execute("PRAGMA foreign_keys = ON;")
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
+                                row = cursor.fetchone()
+                                if row:
+                                    asset_id = row[0]
+                                    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    cursor.execute("""
+                                        INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
+                                        VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
+                                    """, (asset_id, symbol, now_str, cooldown_until_str))
+                                cursor.execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
+                                conn.commit()
+                        except Exception as cd_err:
+                            logger.error(f"[!] {symbol}: cooldown/HWM registration failed ({cd_err}). Dispatching liquidation regardless.")
 
-                    with sqlite3.connect(DEFAULT_DB_PATH) as conn:
-                        conn.execute("PRAGMA foreign_keys = ON;")
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
-                        row = cursor.fetchone()
-                        if row:
-                            asset_id = row[0]
-                            now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                            cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            cursor.execute("""
-                                INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
-                                VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
-                            """, (asset_id, symbol, now_str, cooldown_until_str))
-                        cursor.execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
+                        # 2) Dispatch the liquidation via the direct BrokerClient path.
+                        # v1.3: record the realized round trip first (entry basis =
+                        # Alpaca avg_entry_price, exit = live price at dispatch,
+                        # flagged dispatch_approx) so honest Kelly stats include
+                        # stop-out outcomes. Never blocks the liquidation itself.
+                        try:
+                            import realized_round_trips as _rrt
+                            _rrt.record_trip(
+                                asset_class="TRADFI", symbol=symbol, qty=qty,
+                                entry_price=avg_entry, exit_price=live_price,
+                                reason="STOP_LOSS_BREACH", basis="dispatch_approx",
+                                db_path=DEFAULT_DB_PATH)
+                        except Exception:
+                            pass
+                        logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
+                        await asyncio.to_thread(symbol_client.close_position, symbol)
+
+                        breach_details.append(f"{symbol} stopped out at {trailing_drawdown_pct*100:.2f}% loss from HWM. 24h Cooldown Lock registered.")
+                    else:
+                        positions_telemetry.append({
+                            "symbol": symbol,
+                            "qty": qty,
+                            "avg_cost": avg_entry,
+                            "live_price": live_price,
+                            "hwm": hwm,
+                            "loss_limit": loss_limit,
+                            "floor_price": round(floor_price, 2),
+                            "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
+                            "market_value": round(qty * live_price, 2)
+                        })
+                except Exception as sym_err:
+                    # v1.1: one symbol must NEVER abort the whole sweep. Previously a
+                    # single NameError (missing timedelta import) killed cooldown
+                    # registration + HWM cleanup for every remaining symbol in the pass.
+                    logger.error(f"[!] [{symbol}] per-symbol sweep failure isolated: {sym_err}")
+                    continue
+
+            # v1.1 HWM hygiene: purge orphaned HWM rows (symbols no longer held) so a
+            # fresh entry can never inherit a stale pre-crash high-water mark that sits
+            # above the new entry price (which guaranteed an instant re-stop-out).
+            try:
+                with sqlite3.connect(DEFAULT_DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    rows = cursor.execute("SELECT symbol FROM equities_hwm").fetchall()
+                    orphans = [r[0] for r in rows if r[0] not in held_symbols]
+                    if orphans:
+                        cursor.executemany("DELETE FROM equities_hwm WHERE symbol = ?", [(o,) for o in orphans])
                         conn.commit()
-
-                    breach_details.append(f"{symbol} stopped out at {trailing_drawdown_pct*100:.2f}% loss from HWM. 24h Cooldown Lock registered.")
-                else:
-                    positions_telemetry.append({
-                        "symbol": symbol,
-                        "qty": qty,
-                        "avg_cost": avg_entry,
-                        "live_price": live_price,
-                        "hwm": hwm,
-                        "loss_limit": loss_limit,
-                        "floor_price": round(floor_price, 2),
-                        "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
-                        "market_value": round(qty * live_price, 2)
-                    })
+                        logger.info(f"[*] HWM hygiene: purged {len(orphans)} orphaned HWM row(s): {', '.join(orphans[:10])}")
+            except Exception as hyg_err:
+                logger.error(f"[!] Orphaned HWM cleanup failed: {hyg_err}")
 
             telemetry_payload = {
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),

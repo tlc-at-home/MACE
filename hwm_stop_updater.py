@@ -23,6 +23,11 @@ if BASE_DIR not in sys.path:
 
 from brokers import get_client_by_name
 
+# v1.4: shared-module imports join (repo root is on sys.path above) - the
+# crypto leg gets venue-pool parity and writes a daemon heartbeat.
+import price_venues as price_pool
+import realized_round_trips as rrt
+
 DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.0.110")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -46,16 +51,24 @@ def push_mqtt_telemetry(payload):
         logger.warning(f"[!] MQTT Telemetry exception: {e}")
 
 
-def calculate_24h_rolling_volatility_stop(bars, multiplier=2.5, min_bound=0.030, max_bound=0.080):
+def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.160):
     """
     Calculates dynamic loss limit based on 24-hour rolling 1-minute log returns.
     Formula: horizon_volatility = std(log_returns) * sqrt(1440) * multiplier
-    Clamped between min_bound (3%) and max_bound (8%).
+
+    v1.1 TURNAROUND FIX: defaults widened from 2.5x/3-8% to 5.0x with market-specific
+    clamps (equities 5-12%, crypto 6-16%). The original 2.5x daily-vol corridor sat
+    INSIDE the noise band of a multi-day momentum hold: Monte Carlo replication of
+    this exact exit engine (scripts/mace_stop_autopsy.py, 200 paths x 4 regimes)
+    showed 23-33% of round trips stop out on pure noise in mild/chop tapes, capturing
+    only +2.65% of a +36.9% strong bull, and the 2x-widened stop strictly dominating
+    in every environment. Distance is now Chandelier-equivalent for the holding
+    timeframe instead of one-day noise scale.
     """
     try:
         closes = [float(b["c"]) for b in bars if "c" in b and float(b["c"]) > 0]
         if len(closes) < 120:
-            return 0.040  # Fallback default 4.0% if insufficient bars exist (<120 mins)
+            return 0.080  # Fallback default 8.0% if insufficient bars exist (<120 mins)
 
         log_returns = np.diff(np.log(closes))
         sigma_1m = np.std(log_returns)
@@ -67,7 +80,61 @@ def calculate_24h_rolling_volatility_stop(bars, multiplier=2.5, min_bound=0.030,
         return max(min_bound, min(float(horizon_volatility), max_bound))
     except Exception as e:
         logger.warning(f"[!] Exception calculating volatility stop: {e}")
-        return min_bound
+        # v1.4: failure-direction fix. Returning min_bound (5-6%) on a compute
+        # exception TIGHTENED the corridor below the documented insufficient-
+        # bars fallback (8%) - the wrong direction for a protective stop: a
+        # broken calculation must widen the corridor, never narrow it.
+        return 0.080
+
+
+def calculate_daily_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.120, min_daily_bars=10):
+    """
+    v1.2: equities stop distance from DAILY closes (14-20 calendar day window).
+
+    The intraday 24h/1Min basis starved on weekends and pre-open Mondays
+    (IEX returned <120 1-min bars), which pinned every equity corridor at
+    exactly the static 8.0% fallback for the whole 48h post-deploy window
+    (all 17 held symbols at 8.00%). Daily closes are weekend-immune and
+    express the same "5x daily vol" distance the 5-12% clamp band was sized
+    for (sigma_1m * sqrt(1440) == sigma_daily), restoring per-symbol scaling.
+
+    Returns None when daily history is insufficient or degenerate, so the
+    caller can fall back to the intraday calculation - "no data" stays
+    distinguishable from a genuinely computed corridor.
+    """
+    try:
+        closes = [float(b["c"]) for b in bars if "c" in b and float(b["c"]) > 0]
+        if len(closes) < min_daily_bars:
+            return None
+
+        log_returns = np.diff(np.log(closes))
+        sigma_daily = float(np.std(log_returns))
+        if sigma_daily <= 0.0 or not np.isfinite(sigma_daily):
+            return None
+
+        horizon_volatility = sigma_daily * multiplier
+        return max(min_bound, min(horizon_volatility, max_bound))
+    except Exception as e:
+        logger.warning(f"[!] Exception calculating daily volatility stop: {e}")
+        return None
+
+
+_LAST_VOL_BASIS = {}
+
+
+def note_vol_basis_change(symbol, vol_basis, loss_limit):
+    """
+    v1.2: logs stop-distance basis TRANSITIONS only. The updater daemon sweeps
+    every 60s; per-sweep logging would add ~25k journal lines/day. Transition-only
+    logging keeps the journal quiet while every corridor flip (daily <-> fallback)
+    remains visible for dashboard verification.
+    """
+    try:
+        if _LAST_VOL_BASIS.get(symbol) != vol_basis:
+            _LAST_VOL_BASIS[symbol] = vol_basis
+            logger.info(f"[i] {symbol}: stop-distance basis -> {vol_basis} (corridor {loss_limit * 100:.2f}%)")
+    except Exception:
+        pass
 
 
 def get_db_connection():
@@ -171,23 +238,53 @@ async def sync_tradfi_positions(alpaca_client):
 
             asset_id = get_or_create_asset_id(conn, symbol, asset_class="TRADFI", broker="alpaca")
 
-            # Request 1,440 1-minute bars for 24h volatility profile (using IEX feed for paper accounts)
+            # v1.2: PRIMARY vol basis = 20 calendar days of daily bars. The 24h/1Min
+            # IEX window starved on weekends and pre-open Mondays (<120 bars), which
+            # pinned every equity at the static 8.0% fallback (48h post-deploy: all 17
+            # corridors at exactly 8.0%). Daily closes are weekend-immune and match the
+            # 5x-daily-vol basis the 5-12% clamp band was sized for.
+            vol_basis = "fallback_8pct"
+            loss_limit = None
             try:
-                bars = await asyncio.to_thread(
+                daily_start_str = (now_utc - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                daily_bars = await asyncio.to_thread(
                     alpaca_client.get_historical_bars,
                     symbol,
-                    "1Min",
-                    start_str,
+                    "1Day",
+                    daily_start_str,
                     end_str,
                     "iex"
                 )
+                loss_limit = calculate_daily_volatility_stop(
+                    daily_bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
+                )
+                if loss_limit is not None:
+                    vol_basis = "daily_20d"
             except Exception as e:
-                logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
-                bars = []
+                logger.warning(f"[!] Failed fetching daily bars for {symbol}: {e}")
 
-            loss_limit = calculate_24h_rolling_volatility_stop(
-                bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
-            )
+            # Fallback chain: 24h of 1-minute bars (recent listings / daily feed outage)
+            if loss_limit is None:
+                try:
+                    bars = await asyncio.to_thread(
+                        alpaca_client.get_historical_bars,
+                        symbol,
+                        "1Min",
+                        start_str,
+                        end_str,
+                        "iex"
+                    )
+                except Exception as e:
+                    logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
+                    bars = []
+                if len(bars) >= 120:
+                    vol_basis = "intraday_24h"
+                # v1.1: distance doubled (2.5x -> 5.0x daily vol), clamp widened 3-8% -> 5-12%.
+                loss_limit = calculate_24h_rolling_volatility_stop(
+                    bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
+                )
+
+            note_vol_basis_change(symbol, vol_basis, loss_limit)
 
             prev_info = stored_map.get(symbol, {})
             prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
@@ -206,7 +303,8 @@ async def sync_tradfi_positions(alpaca_client):
                 "live_price": live_price,
                 "hwm": new_hwm,
                 "loss_limit_pct": round(loss_limit * 100, 2),
-                "floor_price": round(floor_price, 2)
+                "floor_price": round(floor_price, 2),
+                "vol_basis": vol_basis
             })
 
     return summary
@@ -233,65 +331,103 @@ async def sync_crypto_positions():
         if not active_positions:
             return []
 
-        import ccxt.async_support as ccxt
-        primary_exchange = ccxt.kucoin({'enableRateLimit': True})
-        fallback_exchange = ccxt.binance({'enableRateLimit': True})
+        # v1.4: venue-pool parity (was hardcoded kucoin -> binance; BEAT/USDT
+        # is KuCoin-only, so a degraded KuCoin session plus a Binance
+        # BadSymbol failover left the ratchet blind for exactly that pair).
+        # Fresh async instance per venue per pass - the pattern that kept
+        # pricing BEAT while the shield's long-lived session failed - with
+        # per-venue isolation and a deterministic close() on every path
+        # (fixes the exception-path aiohttp leak: close previously ran only
+        # on the happy path at the end of the pass).
+        import ccxt.async_support as async_ccxt
+        venues = price_pool.get_venue_list()
+        exchanges = {}
+        try:
+            for venue in venues:
+                venue_cls = getattr(async_ccxt, venue, None)
+                if venue_cls is not None:
+                    exchanges[venue] = venue_cls({'enableRateLimit': True})
 
-        stored_map = get_stored_hwm_map("crypto_hwm")
+            stored_map = get_stored_hwm_map("crypto_hwm")
 
-        with get_db_connection() as conn:
-            for pos in active_positions:
-                token = pos[0]
-                qty = float(pos[1])
-                avg_entry = float(pos[2])
-                pair = f"{token}/USDT"
+            with get_db_connection() as conn:
+                for pos in active_positions:
+                    token = pos[0]
+                    qty = float(pos[1])
+                    avg_entry = float(pos[2])
+                    pair = f"{token}/USDT"
 
-                asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
+                    asset_id = get_or_create_asset_id(conn, pair, asset_class="CRYPTO", broker="kucoin", exchange="BINANCE", currency="USDT")
 
-                live_price = None
-                bars = []
+                    live_price = None
+                    bars = []
+                    first_error = None
+                    served_by = None
 
-                # Fetch live price & 1m OHLCV bars via KuCoin with Binance fallback
+                    # Fetch live price & 1m OHLCV bars from the first pool venue
+                    # that serves the pair (per-venue isolation: a BadSymbol on
+                    # binance no longer masks a working kucoin/bybit read).
+                    for venue in venues:
+                        exchange = exchanges.get(venue)
+                        if exchange is None:
+                            continue
+                        try:
+                            ticker = await exchange.fetch_ticker(pair)
+                            live_price = float(ticker['last'])
+                            ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
+                            bars = [{"c": c[4]} for c in ohlcv]
+                            served_by = venue
+                            break
+                        except Exception as e:
+                            if first_error is None:
+                                first_error = f"{type(e).__name__}: {e}"
+                            continue
+
+                    if served_by is not None and served_by != venues[0]:
+                        logger.info(f"[i] {pair} market data served by {served_by} (primary {venues[0]} failed: {first_error})")
+
+                    if live_price is None:
+                        if first_error is not None:
+                            logger.warning(f"[!] Failed fetching crypto market data for {pair} across {len(venues)} venues (first error: {first_error})")
+                        continue
+
+                    # v1.2: track basis for crypto too (1m bars normally return 1440)
+                    vol_basis = "crypto_1m" if len(bars) >= 120 else "fallback_8pct"
+
+                    # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
+                    # for multi-day horizons; the old 3-8% corridor was a noise-band exit
+                    # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
+                    loss_limit = calculate_24h_rolling_volatility_stop(
+                        bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
+                    )
+                    note_vol_basis_change(pair, vol_basis, loss_limit)
+
+                    prev_info = stored_map.get(pair, {})
+                    prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
+                    new_hwm = max(prev_hwm, live_price)
+
+                    update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
+                    floor_price = new_hwm * (1.0 - loss_limit)
+
+                    summary.append({
+                        "asset_class": "CRYPTO",
+                        "asset_id": asset_id,
+                        "symbol": pair,
+                        "live_price": live_price,
+                        "hwm": new_hwm,
+                        "loss_limit_pct": round(loss_limit * 100, 2),
+                        "floor_price": round(floor_price, 2),
+                        "vol_basis": vol_basis
+                    })
+
+        finally:
+            for exchange in exchanges.values():
                 try:
-                    ticker = await primary_exchange.fetch_ticker(pair)
-                    live_price = float(ticker['last'])
-                    ohlcv = await primary_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
-                    bars = [{"c": c[4]} for c in ohlcv]
-                except Exception as e:
-                    try:
-                        ticker = await fallback_exchange.fetch_ticker(pair)
-                        live_price = float(ticker['last'])
-                        ohlcv = await fallback_exchange.fetch_ohlcv(pair, timeframe='1m', limit=1440)
-                        bars = [{"c": c[4]} for c in ohlcv]
-                    except Exception as fb_err:
-                        logger.warning(f"[!] Failed fetching crypto market data for {pair}: {fb_err}")
-
-                if live_price is None:
-                    continue
-
-                loss_limit = calculate_24h_rolling_volatility_stop(
-                    bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
-                )
-
-                prev_info = stored_map.get(pair, {})
-                prev_hwm = prev_info.get("hwm", max(avg_entry, live_price))
-                new_hwm = max(prev_hwm, live_price)
-
-                update_db_hwm("crypto_hwm", asset_id, pair, new_hwm, loss_limit)
-                floor_price = new_hwm * (1.0 - loss_limit)
-
-                summary.append({
-                    "asset_class": "CRYPTO",
-                    "asset_id": asset_id,
-                    "symbol": pair,
-                    "live_price": live_price,
-                    "hwm": new_hwm,
-                    "loss_limit_pct": round(loss_limit * 100, 2),
-                    "floor_price": round(floor_price, 2)
-                })
-
-        await primary_exchange.close()
-        await fallback_exchange.close()
+                    maybe = exchange.close()
+                    if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
+                        await maybe
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.error(f"[!] Crypto positions HWM sync exception: {e}")
@@ -308,7 +444,11 @@ async def run_update_sweep():
 
     combined_positions = tradfi_summary + crypto_summary
     total_active = len(combined_positions)
-    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active} (TradFi: {len(tradfi_summary)}, Crypto: {len(crypto_summary)})")
+    basis_counts = {}
+    for p in combined_positions:
+        b = p.get("vol_basis", "unknown")
+        basis_counts[b] = basis_counts.get(b, 0) + 1
+    logger.info(f"[+] HWM state sync complete. Active positions updated: {total_active} (TradFi: {len(tradfi_summary)}, Crypto: {len(crypto_summary)}). Vol basis: {basis_counts}")
 
     push_mqtt_telemetry({
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -316,6 +456,17 @@ async def run_update_sweep():
         "active_positions_count": total_active,
         "positions": combined_positions
     })
+
+    # v1.4: daemon heartbeat - an hwm_updater outage silently degrades every
+    # trailing stop to static (ratchet frozen, corridors stale); component_health
+    # makes that outage visible to the dashboard instead of discoverable only
+    # by reading the journal. Telemetry-only: nothing gates on this row yet.
+    try:
+        rrt.write_component_heartbeat(
+            "hwm_updater", "healthy",
+            f"active={total_active} tradfi={len(tradfi_summary)} crypto={len(crypto_summary)}")
+    except Exception:
+        pass
 
 
 async def main():
@@ -330,6 +481,10 @@ async def main():
             await run_update_sweep()
         except Exception as e:
             logger.error(f"[!] Exception in HWM update loop: {e}")
+            try:
+                rrt.write_component_heartbeat("hwm_updater", "degraded", f"sweep exception: {e}")
+            except Exception:
+                pass
 
         if not args.daemon:
             break

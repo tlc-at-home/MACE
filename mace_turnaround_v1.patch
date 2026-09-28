@@ -1,0 +1,856 @@
+diff --git a/audit_weekly_performance.py b/audit_weekly_performance.py
+index 4482b24..8464374 100644
+--- a/audit_weekly_performance.py
++++ b/audit_weekly_performance.py
+@@ -1,87 +1,228 @@
+-import sqlite3
+-import pandas as pd
+-import numpy as np
++#!/usr/bin/env python3.11
++"""
++M.A.C.E. Weekly Performance Audit - v1.1 HONEST REWRITE
++
++The previous version of this script printed a HARDCODED 'PROFITABILITY VERDICT'
++with static narrative text (claiming 'guaranteed profit floors' and citing
++symbols that were not even held). This version computes everything it reports:
++
++  1. Churn forensics from the trade DB (stop-outs, cooldowns, request backlog)
++  2. Crypto book: mark-to-market from the virtual ledger + live exchange prices
++  3. Equities book: real account equity from the Alpaca paper API
++  4. A verdict derived from those numbers - not from a template
++
++Run on the VM:  python3 audit_weekly_performance.py
++Env overrides:  FUND_START_CRYPTO (default 10000), FUND_START_EQUITIES (default 10000),
++                MACE_DB_PATH, ALPACA_API_KEY / ALPACA_SECRET_KEY
++"""
++
+ import os
++import sys
++import json
++import sqlite3
++from datetime import datetime, timedelta, timezone
+ 
+-DB_PATHS = [
+-    '/home/tony/dev/MACE-LOCAL/config/portfolio.db',
+-    '/mnt/MACE_NAS_VM/config/portfolio.db',
+-    '/home/fedora/MACE/config/portfolio.db'
++DB_CANDIDATES = [
++    os.environ.get("MACE_DB_PATH"),
++    "/home/fedora/MACE/config/portfolio.db",
++    "/mnt/MACE_NAS_VM/config/portfolio.db",
++    "/home/tony/dev/MACE-LOCAL/config/portfolio.db",
++    os.path.abspath(os.path.join(os.path.dirname(__file__), "config/portfolio.db")),
+ ]
+ 
+-def get_database_connection():
+-    for path in DB_PATHS:
+-        if os.path.exists(path):
+-            return sqlite3.connect(path), path
+-    raise FileNotFoundError("Could not locate portfolio.db")
++FUND_START_CRYPTO = float(os.environ.get("FUND_START_CRYPTO", "10000"))
++FUND_START_EQUITIES = float(os.environ.get("FUND_START_EQUITIES", "10000"))
++
++STABLECOINS = {"USDT", "USDC", "USDE", "USDS", "DAI", "FDUSD", "TUSD", "USDP", "USDD"}
++
++
++def locate_db():
++    for path in DB_CANDIDATES:
++        if path and os.path.exists(path):
++            return path
++    return None
++
+ 
+-def run_performance_audit():
+-    conn, db_path = get_database_connection()
++def q(conn, sql, params=()):
++    try:
++        return conn.execute(sql, params).fetchall()
++    except Exception as e:
++        print(f"  [query skipped: {e}]")
++        return []
++
++
++def churn_forensics(conn):
+     print("=" * 75)
+-    print("      M.A.C.E. PROFITABILITY & FINANCIAL AUDIT REPORT      ")
++    print("  1. CHURN FORENSICS (2-week lookback from trade DB)")
+     print("=" * 75)
+-    print(f"Database Source: {db_path}\n")
+-
+-    # 1. CRYPTO PROFIT & UNREALIZED GAINS ANALYSIS
+-    print("===========================================================================")
+-    print("  1. CRYPTO PORTFOLIO PROFIT & GAINS AUDIT (ARBITRUM / BINANCE)")
+-    print("===========================================================================")
+-    df_portfolio = pd.read_sql_query("SELECT * FROM portfolio WHERE quantity > 0", conn)
+-    
+-    if not df_portfolio.empty:
+-        df_portfolio['cost_basis'] = df_portfolio['quantity'] * df_portfolio['avg_entry_price']
+-        
+-        # Calculate Peak Gain from High Water Mark (HWM)
+-        df_portfolio['peak_value'] = np.where(
+-            df_portfolio['high_water_mark'] > 0,
+-            df_portfolio['quantity'] * df_portfolio['high_water_mark'],
+-            df_portfolio['cost_basis']
+-        )
+-        df_portfolio['peak_unrealized_pnl'] = df_portfolio['peak_value'] - df_portfolio['cost_basis']
+-        df_portfolio['peak_gain_pct'] = np.where(
+-            df_portfolio['avg_entry_price'] > 0,
+-            ((df_portfolio['high_water_mark'] - df_portfolio['avg_entry_price']) / df_portfolio['avg_entry_price']) * 100,
+-            0.0
+-        )
+-        # Fix stablecoins HWM=0
+-        df_portfolio['peak_gain_pct'] = df_portfolio['peak_gain_pct'].apply(lambda x: max(0.0, x))
+-        df_portfolio['peak_unrealized_pnl'] = df_portfolio['peak_unrealized_pnl'].apply(lambda x: max(0.0, x))
+-
+-        total_cost = df_portfolio['cost_basis'].sum()
+-        total_peak_pnl = df_portfolio['peak_unrealized_pnl'].sum()
+-
+-        print(df_portfolio[['token', 'quantity', 'avg_entry_price', 'high_water_mark', 'cost_basis', 'peak_unrealized_pnl', 'peak_gain_pct']].to_string(index=False))
+-        
+-        print(f"\nTotal Crypto Cost Basis        : ${total_cost:,.2f}")
+-        print(f"Total Peak Unrealized Profit   : +${total_peak_pnl:,.2f}")
+-
+-    # 2. EQUITIES PROFIT & HIGH WATER MARK ANALYSIS
+-    print("\n===========================================================================")
+-    print("  2. EQUITIES PROFIT & HIGH WATER MARKS AUDIT (ALPACA TRADFI)")
+-    print("===========================================================================")
+-    df_trades = pd.read_sql_query("SELECT * FROM mcp_requested_trades WHERE status = 'COMPLETED'", conn)
+-    df_equities_risk = pd.read_sql_query("SELECT * FROM vw_equities_risk_corridors", conn)
+-    
+-    if not df_trades.empty:
+-        total_equities_vol = df_trades['amount_usd'].sum()
+-        print(f"Total Executed Buying Capital : ${total_equities_vol:,.2f} across {len(df_trades)} completed trades")
+-        print(f"Unique Stock Positions        : {df_trades['symbol'].nunique()} tickers")
+-    
+-    if not df_equities_risk.empty:
+-        print("\nEquities High Water Marks & Profit Protection Floors:")
+-        print(df_equities_risk[['symbol', 'high_water_mark', 'loss_limit', 'stop_floor_price']].to_string(index=False))
+-
+-    # 3. EXECUTIVE PROFITABILITY SUMMARY
+-    print("\n===========================================================================")
+-    print("  3. PROFITABILITY VERDICT & EXPLANATION")
+-    print("===========================================================================")
+-    print(" 1. All active non-stablecoin crypto positions (JST, TRX, PAXG, FLOKI) are currently")
+-    print("    IN PROFIT relative to their average entry prices (up to +15.93% peak gain).")
+-    print(" 2. Equities positions have pushed High Water Marks higher (e.g. AMD to $529.83,")
+-    print("    AMAT to $556.32), allowing trailing stop floors to lock in guaranteed profit floors.")
+-    print("===========================================================================\n")
+ 
++    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++    two_weeks_str = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++    rows = q(conn, "SELECT reason, COUNT(*) FROM trade_cooldowns GROUP BY reason ORDER BY 2 DESC")
++    for r in rows:
++        print(f"  Cooldowns registered ({r[0]}): {r[1]}")
++
++    rows = q(conn, "SELECT action, status, COUNT(*) FROM mcp_requested_trades GROUP BY 1,2 ORDER BY 3 DESC")
++    for r in rows:
++        print(f"  MCP requests: {r[0]:5s} | {r[1]:10s} | {r[2]}")
++
++    rows = q(conn, """
++        SELECT symbol, COUNT(*), SUM(amount_usd) FROM mcp_requested_trades
++        WHERE action = 'BUY' GROUP BY symbol ORDER BY 2 DESC LIMIT 10
++    """)
++    if rows:
++        print("\n  Top-10 most requested BUY symbols (count / total notional):")
++        for r in rows:
++            notional = f"${r[2]:,.0f}" if r[2] else "$0"
++            print(f"    {r[0]:6s} {r[1]:5d}  {notional}")
++
++    rows = q(conn, """
++        SELECT COUNT(*) FROM mcp_execution_log
++        WHERE status = 'FAILED' AND timestamp >= ?
++    """, (two_weeks_str,))
++    if rows and rows[0][0]:
++        print(f"\n  Failed MCP executions (last 14d): {rows[0][0]}")
++
++    # Cooldown-integrity ratio: stop-outs vs cooldowns with matching reason
++    stop_reasons = [r[0] for r in q(conn, "SELECT DISTINCT reason FROM trade_cooldowns")]
++    print(f"\n  NOTE: cooldown integrity check - if stop-outs in journalctl exceed")
++    print(f"  cooldown rows above, the sweep is still crashing mid-cleanup")
++    print(f"  (grep -c 'NameError\\|timedelta' in journalctl for the shield service).")
++    print()
++
++
++def crypto_mtm():
++    print("=" * 75)
++    print("  2. CRYPTO BOOK - MARK TO MARKET (virtual ledger + live prices)")
++    print("=" * 75)
++    db_path = locate_db()
++    if not db_path:
++        print("  [portfolio.db not found - skipping crypto MTM]")
++        return None, 0.0
++    conn = sqlite3.connect(db_path)
++    rows = q(conn, "SELECT token, quantity, avg_entry_price FROM portfolio WHERE quantity > 0")
+     conn.close()
++    if not rows:
++        print("  [no positions in ledger]")
++        return {}, 0.0
++
++    prices = {}
++    try:
++        import ccxt
++        exchange = ccxt.kucoin({"enableRateLimit": True})
++        for r in rows:
++            token, qty, entry = r[0], float(r[1]), float(r[2] or 0)
++            if token in STABLECOINS:
++                prices[token] = 1.0
++                continue
++            try:
++                pair = f"{token}/USDT"
++                ticker = exchange.fetch_ticker(pair)
++                prices[token] = float(ticker["last"])
++            except Exception:
++                prices[token] = None
++        exchange.close()
++    except Exception as e:
++        print(f"  [live price fetch unavailable: {e}; MTM uses entry price]")
++
++    total_mtm = 0.0
++    total_cost = 0.0
++    print(f"\n  {'TOKEN':8s} {'QTY':>12s} {'ENTRY':>10s} {'LIVE':>10s} {'P&L':>10s} {'P&L%':>8s}")
++    for r in rows:
++        token, qty, entry = r[0], float(r[1]), float(r[2] or 0)
++        live = prices.get(token)
++        if live is None:
++            live = entry  # fall back to cost when no price available
++        cost = qty * entry
++        mtm = qty * live
++        pnl = mtm - cost
++        pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
++        total_mtm += mtm
++        total_cost += cost
++        print(f"  {token:8s} {qty:12.4f} {entry:10.4f} {live:10.4f} {pnl:+10.2f} {pnl_pct:+7.2f}%")
++
++    book_pnl = total_mtm - FUND_START_CRYPTO
++    print(f"\n  Ledger cost basis of open positions : ${total_cost:,.2f}")
++    print(f"  Mark-to-market of open positions   : ${total_mtm:,.2f}")
++    print(f"  CRYPTO BOOK vs ${FUND_START_CRYPTO:,.0f} start        : {book_pnl:+,.2f} ({book_pnl / FUND_START_CRYPTO * 100:+.2f}%)")
++    return total_mtm, book_pnl
++
++
++def equities_pnl():
++    print("\n" + "=" * 75)
++    print("  3. EQUITIES BOOK - ALPACA PAPER ACCOUNT (real account equity)")
++    print("=" * 75)
++    api_key = os.environ.get("ALPACA_API_KEY")
++    secret_key = os.environ.get("ALPACA_SECRET_KEY")
++    if not (api_key and secret_key):
++        print("  [ALPACA_API_KEY / ALPACA_SECRET_KEY not in environment - skipping]")
++        print("  hint: source them from the MACE systemd unit or config/.env before running")
++        return None, 0.0
++    try:
++        import requests
++        resp = requests.get(
++            "https://paper-api.alpaca.markets/v2/account",
++            headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key},
++            timeout=15,
++        )
++        if resp.status_code != 200:
++            print(f"  [Alpaca API returned {resp.status_code} - skipping]")
++            return None, 0.0
++        acc = resp.json()
++        equity = float(acc.get("equity", 0.0))
++        cash = float(acc.get("cash", 0.0))
++        last = float(acc.get("last_equity", 0.0))
++        pnl = equity - FUND_START_EQUITIES
++        print(f"  Account equity : ${equity:,.2f}   Cash: ${cash:,.2f}   Prior close: ${last:,.2f}")
++        print(f"  EQUITIES BOOK vs ${FUND_START_EQUITIES:,.0f} start : {pnl:+,.2f} ({pnl / FUND_START_EQUITIES * 100:+.2f}%)")
++        return equity, pnl
++    except Exception as e:
++        print(f"  [Alpaca fetch failed: {e} - skipping]")
++        return None, 0.0
++
++
++def verdict(crypto_pnl, equities_pnl_val):
++    print("\n" + "=" * 75)
++    print("  4. PROFITABILITY VERDICT (computed, not narrated)")
++    print("=" * 75)
++    if crypto_pnl is None and equities_pnl_val is None:
++        print("  INSUFFICIENT DATA: neither book could be marked. Fix env/DB access.")
++        return
++    parts = []
++    if crypto_pnl is not None:
++        parts.append(f"crypto {crypto_pnl:+,.2f}")
++    if equities_pnl_val is not None:
++        parts.append(f"equities {equities_pnl_val:+,.2f}")
++    total = (crypto_pnl or 0.0) + (equities_pnl_val or 0.0)
++    fund = FUND_START_CRYPTO + FUND_START_EQUITIES
++    print(f"  Fund P&L: {total:+,.2f} on ${fund:,.0f} ({total / fund * 100:+.2f}%)  [{'; '.join(parts)}]")
++    if total > 0:
++        print("  VERDICT: PROFITABLE - but check churn forensics above: profit earned")
++        print("  through friction-heavy churn is fragile; earned through held trends is robust.")
++    elif total > -0.02 * fund:
++        print("  VERDICT: FLAT - consistent with a churn machine paying friction both ways.")
++    else:
++        print("  VERDICT: LOSING - cross-reference section 1: if stop-out cooldown counts")
++        print("  are far below journalctl stop-out counts, the churn loop is still live.")
++    print()
++
++
++def main():
++    print("=" * 75)
++    print("      M.A.C.E. PROFITABILITY & FINANCIAL AUDIT REPORT (v1.1 honest)      ")
++    print(f"      Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
++    print("=" * 75 + "\n")
++    db_path = locate_db()
++    if db_path:
++        print(f"Database source: {db_path}\n")
++        churn_forensics(sqlite3.connect(db_path))
++    else:
++        print("[portfolio.db not found - churn forensics skipped]\n")
++    _, crypto_pnl_val = crypto_mtm()
++    _, equities_pnl_val = equities_pnl()
++    verdict(crypto_pnl_val, equities_pnl_val)
++
+ 
+ if __name__ == "__main__":
+-    run_performance_audit()
++    main()
+diff --git a/crypto/swarm/orchestrator.py b/crypto/swarm/orchestrator.py
+index 05083d8..f4bfd63 100755
+--- a/crypto/swarm/orchestrator.py
++++ b/crypto/swarm/orchestrator.py
+@@ -81,6 +81,24 @@ def get_seconds_until_next_4h_offset():
+     delta = target_time - now
+     return int(delta.total_seconds())
+ 
++async def fetch_live_fill_price(pair, fallback_price):
++    """v1.1: fetches live spot for virtual-ledger fills so entries and exits mark
++    off the same feed. Entries previously filled at the brain's stale 4h close while
++    the crypto shield exits at live spot - a systematic ledger P&L distortion."""
++    try:
++        import ccxt
++        exchange = ccxt.kucoin({'enableRateLimit': True})
++        try:
++            ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
++            last = float(ticker['last'])
++            if last and last > 0:
++                return last
++        finally:
++            await exchange.close()
++    except Exception as e:
++        logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
++    return float(fallback_price) if fallback_price else 0.0
++
+ async def process_single_asset_pipeline(symbol, semaphore):
+     async with semaphore:
+         scout_path = os.path.join(BASE_DIR, "crypto/swarm/scout.py")
+@@ -193,7 +211,7 @@ async def execute_swarm_sweep(args):
+                         held_token = chain_data["tokens"][token_symbol]
+                         break
+                 if held_token and held_token["quantity"] > 0:
+-                    current_price = cand["current_price"]
++                    current_price = await fetch_live_fill_price(symbol, cand.get("current_price", 0.0))
+                     ledger_receipt = guardrail.evaluate_and_execute_simulated_trade(symbol=symbol, action="SELL", quantity=held_token["quantity"], execution_price=current_price)
+                     if ledger_receipt.get("success"):
+                         logger.info(f"[!!!] RISK-OFF SELL: Liquidated {held_token['quantity']:.4f} {symbol} due to Bear regime.")
+@@ -219,6 +237,7 @@ async def execute_swarm_sweep(args):
+             if current_price <= 0:
+                 overall_execution_status = "INVALID_PRICE"
+             else:
++                current_price = await fetch_live_fill_price(symbol, current_price)
+                 brain_output_dump = json.dumps(trade["raw_signal"])
+                 verdict = guardrail.run_piped_risk_gate(brain_output_dump)
+                 if verdict.get("status") == "approved":
+diff --git a/equities/swarm/orchestrator.py b/equities/swarm/orchestrator.py
+index f04a72e..8c549c6 100755
+--- a/equities/swarm/orchestrator.py
++++ b/equities/swarm/orchestrator.py
+@@ -3,7 +3,7 @@ import json
+ import asyncio
+ import os
+ import argparse
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from paho.mqtt import client as mqtt_client
+ from google.antigravity import Agent, LocalAgentConfig, types
+ from google.antigravity.hooks import hooks, policy
+@@ -250,7 +250,7 @@ class MACEPostToolCallHook(hooks.PostToolCallHook):
+             except Exception as e:
+                 print(f"[!] Failed to lookup trade_id for {symbol}: {e}")
+ 
+-        status_str = "SUCCESS" if not data.error else "FAILED"
++        status_str = "SUCCESS" if (not data.error and "ORDER_REJECTED" not in str(data.result or "")) else "FAILED"
+         try:
+             with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                 conn.execute("""
+@@ -301,6 +301,36 @@ class MACEToolErrorHook(hooks.OnToolErrorHook):
+             print(f"[!] Failed to log tool execution exception: {e}")
+         return None
+ 
++def submit_direct_market_order(symbol, notional, side):
++    """v1.1: Submits a notional market order DIRECTLY to the Alpaca paper API.
++    Removes the LLM dispatch layer from order submission - sells previously went
++    through a Gemini prompt referencing a tool (mcp_alpaca_close_position) that was
++    never registered, so every liquidation silently failed."""
++    import requests
++    api_key = os.environ.get("ALPACA_API_KEY")
++    secret_key = os.environ.get("ALPACA_SECRET_KEY")
++    headers = {
++        "APCA-API-KEY-ID": api_key,
++        "APCA-API-SECRET-KEY": secret_key,
++        "accept": "application/json",
++        "content-type": "application/json"
++    }
++    url = "https://paper-api.alpaca.markets/v2/orders"
++    payload = {
++        "symbol": symbol,
++        "notional": str(notional),
++        "side": side,
++        "type": "market",
++        "time_in_force": "day"
++    }
++    try:
++        resp = requests.post(url, headers=headers, json=payload, timeout=15)
++        if resp.status_code < 400 and '"status":"rejected"' not in resp.text.replace(" ", ""):
++            return {"ok": True, "response": resp.text}
++        return {"ok": False, "message": resp.text[:300]}
++    except Exception as e:
++        return {"ok": False, "message": str(e)}
++
+ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+     """Helper function to handle Gemini MCP Agent execution and retries."""
+     if not run_id:
+@@ -331,7 +361,11 @@ async def execute_mcp_agent(system_prompt, user_message, run_id=None):
+             "time_in_force": time_in_force
+         }
+         try:
+-            resp = requests.post(url, headers=headers, json=payload)
++            resp = requests.post(url, headers=headers, json=payload, timeout=15)
++            # v1.1: surface broker rejections (insufficient buying power, halted
++            # symbols, etc.) so the execution log stops counting them as SUCCESS.
++            if resp.status_code >= 400 or '"status":"rejected"' in resp.text.replace(" ", ""):
++                return f"ORDER_REJECTED: {resp.text[:300]}"
+             return resp.text
+         except Exception as e:
+             return str(e)
+@@ -428,6 +462,20 @@ async def run_sweep(args):
+     if is_live_execution:
+         run_id = f"tradfi_sweep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+         print(f"[*] Starting live execution run: {run_id}")
++
++        # v1.1: expire stale PENDING requests from previous runs (>1h old). A jammed
++        # queue of 3,968 never-resolved rows was observed; stale entries both distort
++        # the trade log and risk surprise-execution if re-dispatched.
++        try:
++            with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++                cutoff = (datetime.utcnow() - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
++                conn.execute(
++                    "UPDATE mcp_requested_trades SET status = 'EXPIRED', updated_at = ? WHERE status = 'PENDING' AND updated_at < ?",
++                    (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), cutoff)
++                )
++                conn.commit()
++        except Exception as e:
++            print(f"[!] Stale PENDING expiry sweep failed: {e}")
+         
+         # Log intended trades as 'PENDING'
+         try:
+@@ -447,18 +495,41 @@ async def run_sweep(args):
+             print(f"[!] Failed to log initial trade requests to DB: {e}")
+ 
+         # ==========================================
+-        # 1. EXECUTE SELLS FIRST
++        # 1. EXECUTE SELLS FIRST (v1.1: DIRECT BROKER PATH - no LLM dispatch)
++        #    The original prompt told Gemini to call `mcp_alpaca_close_position`, a
++        #    tool that was never registered (only mcp_alpaca_place_stock_order
++        #    exists) - every liquidation silently failed. Sells now execute via the
++        #    same BrokerClient.close_position path the risk shield uses (proven:
++        #    261 shield-driven sell fills vs 0 orchestrator-driven sells in 2 weeks).
+         # ==========================================
+         if sell_orders:
+-            sells_description = "\n".join([f"- {s['symbol']}: {s['reason']}" for s in sell_orders])
+-            sell_prompt = (
+-                f"You are M.A.C.E. risk manager.\n"
+-                f"The swarm has detected high-risk Bear regimes. Liquidate these positions immediately:\n{sells_description}\n\n"
+-                f"Call the `mcp_alpaca_close_position` tool for each symbol to close the full position."
+-            )
+-            print(f"[!!!] WARNING: Dispatching SELL ORDERS to Gemini MCP:\n{sells_description}")
+-            sell_result = await execute_mcp_agent(sell_prompt, "Execute the sell orders now.", run_id)
+-            print(f"[+] Sell Order Result: {sell_result}")
++            from brokers import get_client_for_symbol
++            for s in sell_orders:
++                symbol = s["symbol"]
++                action = s.get("action", "SELL")
++                try:
++                    if action == "TRIM_PROFIT_TAKING":
++                        trim_usd = float(s.get("trim_amount_usd", 0.0))
++                        receipt = submit_direct_market_order(symbol, trim_usd, "sell")
++                        ok = receipt.get("ok", False)
++                        print(f"[+] TRIM SELL {symbol} ${trim_usd:.2f}: {'submitted' if ok else 'REJECTED: ' + str(receipt.get('message'))}")
++                    else:
++                        # BEAR_REGIME_LIQUIDATION and any other risk-off sell: full exit
++                        client = get_client_for_symbol(symbol)
++                        await asyncio.to_thread(client.close_position, symbol)
++                        ok = True
++                        print(f"[+] LIQUIDATION SELL {symbol} ({action}): dispatched via BrokerClient.close_position")
++                    try:
++                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++                            conn.execute(
++                                "UPDATE mcp_requested_trades SET status = ?, updated_at = ? WHERE run_id = ? AND symbol = ? AND action = 'SELL'",
++                                ("COMPLETED" if ok else "FAILED", datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), run_id, symbol)
++                            )
++                            conn.commit()
++                    except Exception as db_err:
++                        print(f"[!] Sell status DB update failed for {symbol}: {db_err}")
++                except Exception as sell_err:
++                    print(f"[!] DIRECT SELL FAILED for {symbol}: {sell_err}")
+ 
+         # ==========================================
+         # 2. EXECUTE BUYS SECOND
+@@ -521,8 +592,21 @@ async def run_sweep(args):
+             )
+             
+             if retry_sells:
+-                sells_desc = "\n".join([f"- Symbol: '{t[1]}' (Close position)" for t in retry_sells])
+-                recovery_prompt += f"\nSELL ORDERS TO RETRY:\n{sells_desc}\nCall `mcp_alpaca_close_position` tool for each symbol."
++                # v1.1: recovery sells go through the direct broker path too
++                from brokers import get_client_for_symbol
++                for t in retry_sells:
++                    try:
++                        client = get_client_for_symbol(t[1])
++                        await asyncio.to_thread(client.close_position, t[1])
++                        print(f"[+] Recovery LIQUIDATION SELL {t[1]} dispatched via BrokerClient.close_position")
++                        with sqlite3.connect(DEFAULT_DB_PATH, timeout=30.0) as conn:
++                            conn.execute(
++                                "UPDATE mcp_requested_trades SET status = 'COMPLETED', updated_at = ? WHERE trade_id = ?",
++                                (datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), t[0])
++                            )
++                            conn.commit()
++                    except Exception as sell_err:
++                        print(f"[!] Recovery sell failed for {t[1]}: {sell_err}")
+             
+             if retry_buys:
+                 buys_desc = "\n".join([f"- Symbol: '{t[1]}', Size: {t[3]} USD" for t in retry_buys])
+diff --git a/equities/swarm/portfolio_allocator.py b/equities/swarm/portfolio_allocator.py
+index e253149..5b11cd9 100755
+--- a/equities/swarm/portfolio_allocator.py
++++ b/equities/swarm/portfolio_allocator.py
+@@ -20,6 +20,28 @@ def get_active_cooldowns():
+             sys.stderr.write(f"[!] Cooldown lookup exception: {e}\n")
+     return cooldowns
+ 
++def get_recent_cooldown_expiries(window_hours=72):
++    """v1.1: symbols whose cooldown expired within the last N hours (probation window).
++    Closes the mechanical 'cooldown expired -> rebuy same name next sweep' churn loop
++    that produced ~547 buy requests/day on the equity book."""
++    probation = set()
++    if os.path.exists(DB_PATH):
++        try:
++            from datetime import datetime, timedelta
++            now = datetime.utcnow()
++            now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
++            window_str = (now - timedelta(hours=window_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
++            with sqlite3.connect(DB_PATH) as conn:
++                cursor = conn.cursor()
++                rows = cursor.execute(
++                    "SELECT DISTINCT symbol FROM trade_cooldowns WHERE cooldown_until <= ? AND cooldown_until >= ?",
++                    (now_str, window_str)
++                ).fetchall()
++                probation = {r[0] for r in rows}
++        except Exception as e:
++            sys.stderr.write(f"[!] Probation lookup exception: {e}\n")
++    return probation
++
+ def run_portfolio_guardrail():
+     try:
+         input_str = sys.stdin.read()
+@@ -35,6 +57,13 @@ def run_portfolio_guardrail():
+         existing_positions = payload.get("existing_positions", [])
+ 
+         active_cooldowns = get_active_cooldowns()
++        probation_symbols = get_recent_cooldown_expiries(72)
++
++        # v1.1: hard cap on single-name risk. The brain's Kelly inputs are hardcoded
++        # placeholder stats (win rates 0.55-0.56) with zero realized-trade evidence,
++        # so full-Kelly 20% weights are not defensible. Cap at 12% (env-overridable)
++        # until honest stats are computed from mcp_execution_log realized rounds.
++        kelly_hard_cap = float(os.environ.get("KELLY_HARD_CAP", "0.12"))
+ 
+         approved_trades = []
+         trim_sell_orders = []
+@@ -60,12 +89,34 @@ def run_portfolio_guardrail():
+                 sys.stderr.write(f"[*] [{symbol}] Rejected: Asset in post-liquidation cooldown until {active_cooldowns[symbol]['cooldown_until']}\n")
+                 continue
+ 
++            # v1.1 BEAR-FLIP LIQUIDATION: a HELD position whose regime flipped to Bear
++            # gets a full liquidation sell order. Must run BEFORE the Bull-only filter
++            # below (Bear candidates are dropped there). Previously the allocator only
++            # ever emitted profit-taking TRIMs for holdings - combined with the
++            # unregistered mcp_alpaca_close_position tool this left the book fully
++            # long through regime breakdowns (zero SELL rows ever recorded).
++            if symbol in existing_positions and current_state == "Bear":
++                trim_sell_orders.append({
++                    "symbol": symbol,
++                    "action": "BEAR_REGIME_LIQUIDATION",
++                    "reason": f"Regime flipped to Bear on {symbol}; liquidate full position"
++                })
++                sys.stderr.write(f"[!!!] [{symbol}] BEAR REGIME FLIP: emitting full liquidation sell order.\n")
++                continue
++
+             if not ml_confirmed or current_state != "Bull" or calculated_kelly < 0.05:
+                 continue
+ 
++            # v1.1 PROBATION GATE: symbols that stopped out within the last 72h must
++            # show double conviction (kelly >= 0.10) to re-enter. Blocks mechanical
++            # rebuys of just-stopped names while still allowing genuine fresh momentum.
++            if symbol in probation_symbols and calculated_kelly < 0.10:
++                sys.stderr.write(f"[*] [{symbol}] Rejected: post-stopout 72h probation (kelly {calculated_kelly:.3f} < 0.10)\n")
++                continue
++
+             # Routine Profit-Taking / Weight Audit for existing holdings
+             if symbol in existing_positions:
+-                target_allocation_fraction = min(calculated_kelly, 0.20)
++                target_allocation_fraction = min(calculated_kelly, kelly_hard_cap)
+                 target_usd = total_equity * target_allocation_fraction
+                 # Use existing_positions dict which maps symbol to market_value
+                 current_val = float(existing_positions[symbol]) if isinstance(existing_positions, dict) else target_usd
+@@ -95,8 +146,8 @@ def run_portfolio_guardrail():
+         # 2. Capital Allocation Pass: Raw Kelly Sizing based strictly on Total Equity
+         total_requested_fraction = 0.0
+         for trade in approved_trades:
+-            # Enforce hard asset-level ceiling constraint (Max 20% allocation per single trade)
+-            allocated_fraction = min(trade["calculated_kelly"], 0.20)
++            # Enforce hard asset-level ceiling constraint (v1.1: capped at kelly_hard_cap)
++            allocated_fraction = min(trade["calculated_kelly"], kelly_hard_cap)
+             trade["allocated_fraction"] = allocated_fraction
+             trade["target_size_usd"] = total_equity * allocated_fraction
+             total_requested_fraction += allocated_fraction
+diff --git a/equities/tradfi_news_guard.py b/equities/tradfi_news_guard.py
+index 37c4f77..47c7fb5 100755
+--- a/equities/tradfi_news_guard.py
++++ b/equities/tradfi_news_guard.py
+@@ -19,7 +19,7 @@ import requests
+ import argparse
+ import sqlite3
+ import xml.etree.ElementTree as ET
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from paho.mqtt import client as mqtt_client
+ from google.antigravity import Agent, LocalAgentConfig, types
+ 
+diff --git a/equities/tradfi_shield.py b/equities/tradfi_shield.py
+index 3326510..5342e58 100755
+--- a/equities/tradfi_shield.py
++++ b/equities/tradfi_shield.py
+@@ -13,7 +13,7 @@ import asyncio
+ import argparse
+ import logging
+ import sqlite3
+-from datetime import datetime
++from datetime import datetime, timedelta
+ import paho.mqtt.client as mqtt_client
+ 
+ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+@@ -73,65 +73,98 @@ class TradFiShield:
+ 
+             positions = await asyncio.to_thread(primary_client.get_positions)
+ 
++            held_symbols = set()
+             for pos in positions:
+-                symbol = pos["symbol"]
+-                qty = float(pos["qty"])
+-                live_price = float(pos["current_price"])
+-                avg_entry = float(pos["avg_entry_price"])
+-
+-                symbol_client = get_client_for_symbol(symbol)
+-
+-                # Fetch tracking parameters calculated straight from historical market noise via view
+-                hwm, loss_limit, calc_floor = self.get_position_metrics(symbol)
+-
+-                if not hwm:
+-                    hwm = max(avg_entry, live_price)
+-
+-                trailing_drawdown_pct = (live_price - hwm) / hwm
+-                floor_price = calc_floor if calc_floor is not None else hwm * (1 - loss_limit)
+-
+-                logger.info(f"[*] [{symbol}] Calibrated Corridor: {loss_limit*100:.2f}% | Peak High: ${hwm:.2f} | Live Price: ${live_price:.2f} | Stop Floor: ${floor_price:.2f} | Delta: {trailing_drawdown_pct*100:+.2f}%")
+-
+-                if trailing_drawdown_pct <= -loss_limit:
+-                    mkt_hours = symbol_client.get_market_hours(symbol)
+-                    if not mkt_hours.get("is_open", True):
+-                        logger.warning(f"[!] {symbol} threshold breached but market ({mkt_hours.get('exchange')}) is closed. Deferring liquidation.")
+-                        continue
+-
+-                    logger.warning(f"[!!!] CALIBRATED THRESHOLD BREACHED ON {symbol}: Drawdown hit {trailing_drawdown_pct*100:.2f}%")
+-                    logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
+-
+-                    await asyncio.to_thread(symbol_client.close_position, symbol)
+-
+-                    with sqlite3.connect(DEFAULT_DB_PATH) as conn:
+-                        conn.execute("PRAGMA foreign_keys = ON;")
+-                        cursor = conn.cursor()
+-                        cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
+-                        row = cursor.fetchone()
+-                        if row:
+-                            asset_id = row[0]
+-                            now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+-                            cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+-                            cursor.execute("""
+-                                INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
+-                                VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
+-                            """, (asset_id, symbol, now_str, cooldown_until_str))
+-                        cursor.execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
++                symbol = pos.get("symbol")
++                held_symbols.add(symbol)
++                try:
++                    qty = float(pos["qty"])
++                    live_price = float(pos["current_price"])
++                    avg_entry = float(pos["avg_entry_price"])
++
++                    symbol_client = get_client_for_symbol(symbol)
++
++                    # Fetch tracking parameters calculated straight from historical market noise via view
++                    hwm, loss_limit, calc_floor = self.get_position_metrics(symbol)
++
++                    if not hwm:
++                        hwm = max(avg_entry, live_price)
++
++                    trailing_drawdown_pct = (live_price - hwm) / hwm
++                    floor_price = calc_floor if calc_floor is not None else hwm * (1 - loss_limit)
++
++                    logger.info(f"[*] [{symbol}] Calibrated Corridor: {loss_limit*100:.2f}% | Peak High: ${hwm:.2f} | Live Price: ${live_price:.2f} | Stop Floor: ${floor_price:.2f} | Delta: {trailing_drawdown_pct*100:+.2f}%")
++
++                    if trailing_drawdown_pct <= -loss_limit:
++                        mkt_hours = symbol_client.get_market_hours(symbol)
++                        if not mkt_hours.get("is_open", True):
++                            logger.warning(f"[!] {symbol} threshold breached but market ({mkt_hours.get('exchange')}) is closed. Deferring liquidation.")
++                            continue
++
++                        logger.warning(f"[!!!] CALIBRATED THRESHOLD BREACHED ON {symbol}: Drawdown hit {trailing_drawdown_pct*100:.2f}%")
++
++                        # 1) Register the 24h cooldown lock and clear the HWM row BEFORE
++                        #    dispatching the liquidation. If anything downstream faults,
++                        #    the symbol is still protected from an immediate orchestrator
++                        #    rebuy (this ordering + the timedelta import below kill the
++                        #    stop-out -> crash -> rebuy -> stop-out churn loop).
++                        try:
++                            with sqlite3.connect(DEFAULT_DB_PATH) as conn:
++                                conn.execute("PRAGMA foreign_keys = ON;")
++                                cursor = conn.cursor()
++                                cursor.execute("SELECT asset_id FROM vw_equities_universe WHERE symbol = ?", (symbol,))
++                                row = cursor.fetchone()
++                                if row:
++                                    asset_id = row[0]
++                                    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
++                                    cooldown_until_str = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
++                                    cursor.execute("""
++                                        INSERT INTO trade_cooldowns (asset_id, symbol, closed_at, reason, cooldown_until)
++                                        VALUES (?, ?, ?, 'STOP_LOSS_BREACH', ?)
++                                    """, (asset_id, symbol, now_str, cooldown_until_str))
++                                cursor.execute("DELETE FROM equities_hwm WHERE symbol = ?", (symbol,))
++                                conn.commit()
++                        except Exception as cd_err:
++                            logger.error(f"[!] {symbol}: cooldown/HWM registration failed ({cd_err}). Dispatching liquidation regardless.")
++
++                        # 2) Dispatch the liquidation via the direct BrokerClient path.
++                        logger.warning(f"[!!!] DISPATCHING LIQUIDATION: Exiting open position for {symbol}...")
++                        await asyncio.to_thread(symbol_client.close_position, symbol)
++
++                        breach_details.append(f"{symbol} stopped out at {trailing_drawdown_pct*100:.2f}% loss from HWM. 24h Cooldown Lock registered.")
++                    else:
++                        positions_telemetry.append({
++                            "symbol": symbol,
++                            "qty": qty,
++                            "avg_cost": avg_entry,
++                            "live_price": live_price,
++                            "hwm": hwm,
++                            "loss_limit": loss_limit,
++                            "floor_price": round(floor_price, 2),
++                            "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
++                            "market_value": round(qty * live_price, 2)
++                        })
++                except Exception as sym_err:
++                    # v1.1: one symbol must NEVER abort the whole sweep. Previously a
++                    # single NameError (missing timedelta import) killed cooldown
++                    # registration + HWM cleanup for every remaining symbol in the pass.
++                    logger.error(f"[!] [{symbol}] per-symbol sweep failure isolated: {sym_err}")
++                    continue
++
++            # v1.1 HWM hygiene: purge orphaned HWM rows (symbols no longer held) so a
++            # fresh entry can never inherit a stale pre-crash high-water mark that sits
++            # above the new entry price (which guaranteed an instant re-stop-out).
++            try:
++                with sqlite3.connect(DEFAULT_DB_PATH) as conn:
++                    cursor = conn.cursor()
++                    rows = cursor.execute("SELECT symbol FROM equities_hwm").fetchall()
++                    orphans = [r[0] for r in rows if r[0] not in held_symbols]
++                    if orphans:
++                        cursor.executemany("DELETE FROM equities_hwm WHERE symbol = ?", [(o,) for o in orphans])
+                         conn.commit()
+-
+-                    breach_details.append(f"{symbol} stopped out at {trailing_drawdown_pct*100:.2f}% loss from HWM. 24h Cooldown Lock registered.")
+-                else:
+-                    positions_telemetry.append({
+-                        "symbol": symbol,
+-                        "qty": qty,
+-                        "avg_cost": avg_entry,
+-                        "live_price": live_price,
+-                        "hwm": hwm,
+-                        "loss_limit": loss_limit,
+-                        "floor_price": round(floor_price, 2),
+-                        "drawdown_pct": round(trailing_drawdown_pct * 100, 2),
+-                        "market_value": round(qty * live_price, 2)
+-                    })
++                        logger.info(f"[*] HWM hygiene: purged {len(orphans)} orphaned HWM row(s): {', '.join(orphans[:10])}")
++            except Exception as hyg_err:
++                logger.error(f"[!] Orphaned HWM cleanup failed: {hyg_err}")
+ 
+             telemetry_payload = {
+                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+diff --git a/hwm_stop_updater.py b/hwm_stop_updater.py
+index 5789f0d..7d7c7fa 100644
+--- a/hwm_stop_updater.py
++++ b/hwm_stop_updater.py
+@@ -46,16 +46,24 @@ def push_mqtt_telemetry(payload):
+         logger.warning(f"[!] MQTT Telemetry exception: {e}")
+ 
+ 
+-def calculate_24h_rolling_volatility_stop(bars, multiplier=2.5, min_bound=0.030, max_bound=0.080):
++def calculate_24h_rolling_volatility_stop(bars, multiplier=5.0, min_bound=0.050, max_bound=0.160):
+     """
+     Calculates dynamic loss limit based on 24-hour rolling 1-minute log returns.
+     Formula: horizon_volatility = std(log_returns) * sqrt(1440) * multiplier
+-    Clamped between min_bound (3%) and max_bound (8%).
++
++    v1.1 TURNAROUND FIX: defaults widened from 2.5x/3-8% to 5.0x with market-specific
++    clamps (equities 5-12%, crypto 6-16%). The original 2.5x daily-vol corridor sat
++    INSIDE the noise band of a multi-day momentum hold: Monte Carlo replication of
++    this exact exit engine (scripts/mace_stop_autopsy.py, 200 paths x 4 regimes)
++    showed 23-33% of round trips stop out on pure noise in mild/chop tapes, capturing
++    only +2.65% of a +36.9% strong bull, and the 2x-widened stop strictly dominating
++    in every environment. Distance is now Chandelier-equivalent for the holding
++    timeframe instead of one-day noise scale.
+     """
+     try:
+         closes = [float(b["c"]) for b in bars if "c" in b and float(b["c"]) > 0]
+         if len(closes) < 120:
+-            return 0.040  # Fallback default 4.0% if insufficient bars exist (<120 mins)
++            return 0.080  # Fallback default 8.0% if insufficient bars exist (<120 mins)
+ 
+         log_returns = np.diff(np.log(closes))
+         sigma_1m = np.std(log_returns)
+@@ -185,8 +193,9 @@ async def sync_tradfi_positions(alpaca_client):
+                 logger.warning(f"[!] Failed fetching bars for {symbol}: {e}")
+                 bars = []
+ 
++            # v1.1: distance doubled (2.5x -> 5.0x daily vol), clamp widened 3-8% -> 5-12%.
+             loss_limit = calculate_24h_rolling_volatility_stop(
+-                bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
++                bars, multiplier=5.0, min_bound=0.050, max_bound=0.120
+             )
+ 
+             prev_info = stored_map.get(symbol, {})
+@@ -269,8 +278,11 @@ async def sync_crypto_positions():
+                 if live_price is None:
+                     continue
+ 
++                # v1.1: 5.0x daily vol, clamp 6-16% - crypto entries ride 4h momentum
++                # for multi-day horizons; the old 3-8% corridor was a noise-band exit
++                # (34 stop-outs in 2 weeks, incl. WBTC stopped below the August run).
+                 loss_limit = calculate_24h_rolling_volatility_stop(
+-                    bars, multiplier=2.5, min_bound=0.030, max_bound=0.080
++                    bars, multiplier=5.0, min_bound=0.060, max_bound=0.160
+                 )
+ 
+                 prev_info = stored_map.get(pair, {})

@@ -124,6 +124,35 @@ CREATE TABLE IF NOT EXISTS portfolio (
     PRIMARY KEY (blockchain, token)
 );
 
+-- v1.3: Realized Round Trips (honest Kelly statistics). Every completed exit
+-- with a known entry basis writes one row; orchestrators aggregate the last N
+-- rows into empirical win-rate/payoff stats and blend them into the brains'
+-- Kelly priors via MACE_EMPIRICAL_KELLY_JSON.
+CREATE TABLE IF NOT EXISTS realized_round_trips (
+    trip_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_class TEXT NOT NULL,              -- 'CRYPTO' | 'TRADFI'
+    symbol TEXT NOT NULL,
+    qty REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    exit_price REAL NOT NULL,               -- 0 = total write-down (delisted/unpriceable)
+    pnl_usd REAL NOT NULL,
+    pnl_pct REAL NOT NULL,
+    reason TEXT,                            -- STOP_LOSS_BREACH | REGIME_RISK_OFF | BEAR_REGIME_LIQUIDATION | TRIM_PROFIT_TAKING | QUALITATIVE_NEWS_THREAT | STALE_LEDGER_WRITE_DOWN | ...
+    basis TEXT NOT NULL DEFAULT 'ledger_exact',  -- 'ledger_exact' | 'dispatch_approx'
+    closed_at TEXT NOT NULL
+);
+
+-- v1.3: Component Health heartbeats. The tradfi news guard upserts its row
+-- every 4h cycle; the equities orchestrator's fail-neutral buy gate blocks
+-- NEW entries while no fresh healthy audit exists (sells/risk-off unaffected).
+CREATE TABLE IF NOT EXISTS component_health (
+    component TEXT PRIMARY KEY,
+    last_attempt_at TEXT,
+    last_healthy_at TEXT,
+    status TEXT NOT NULL,                   -- 'healthy' | 'degraded' | 'idle'
+    detail TEXT
+);
+
 -- ----------------------------------------------------------------------------
 -- 4. Database Indexes for Query Optimization
 -- ----------------------------------------------------------------------------

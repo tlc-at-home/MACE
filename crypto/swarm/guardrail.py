@@ -19,6 +19,19 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "config/portfolio.db")
 MAX_SINGLE_ASSET_EXPOSURE = 0.25
 MIN_TRADE_SIZE_USD = 10.0
 
+# v1.3: virtual-ledger taker fee (default 0.1% = KuCoin spot taker). Pre-v1.3
+# fills were gross, so simulated crypto P&L was systematically optimistic by
+# ~0.2% per round trip versus what a real account would have realized.
+TAKER_FEE = float(os.getenv("MACE_TAKER_FEE", "0.001"))
+
+# v1.3: realized round-trip writer (honest Kelly stats) lives at repo root.
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+try:
+    import realized_round_trips as rrt
+except Exception:
+    rrt = None
+
 def get_db_connection(db_path=DEFAULT_DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     abs_db_path = os.path.abspath(db_path)
@@ -184,7 +197,7 @@ def get_wallet_balances_summary():
 
     return summary
 
-def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price):
+def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_price, reason="LEDGER_SELL"):
     blockchain = "SOLANA" if "SOL" in symbol else "ARBITRUM"
     token = symbol.split("/")[0]
     conn = get_db_connection()
@@ -195,11 +208,15 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
         usdt_row = cursor.fetchone()
         current_usdt_cash = float(usdt_row["quantity"]) if usdt_row else 0.0
 
-        trade_value_usd = quantity * execution_price
-
         if action == "BUY":
+            # v1.3: taker fee on entries - cash debited gross+fee, entry cost
+            # basis includes the fee (what a real taker actually pays).
+            gross_value_usd = quantity * execution_price
+            buy_fee_usd = gross_value_usd * TAKER_FEE
+            trade_value_usd = gross_value_usd + buy_fee_usd
+
             if trade_value_usd > current_usdt_cash:
-                return {"success": False, "error": "Insufficient USDT cash liquidity to fill asset allocation request."}
+                return {"success": False, "error": "Insufficient USDT cash liquidity (incl. taker fee) to fill asset allocation request."}
 
             if trade_value_usd < MIN_TRADE_SIZE_USD:
                 return {"success": False, "error": f"Requested transaction size (${trade_value_usd:.2f}) fits beneath minimum scale filter."}
@@ -230,18 +247,20 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
             else:
                 cursor.execute(
                     "INSERT INTO portfolio (blockchain, token, quantity, avg_entry_price) VALUES (?, ?, ?, ?)",
-                    (blockchain, token, quantity, execution_price)
+                    (blockchain, token, quantity, execution_price * (1.0 + TAKER_FEE))
                 )
                 new_balance = quantity
-                new_avg_price = execution_price
+                new_avg_price = execution_price * (1.0 + TAKER_FEE)
 
             conn.commit()
+            logger.info(f"[ledger] BUY {symbol} ${gross_value_usd:.2f} gross + ${buy_fee_usd:.2f} taker fee @ ${execution_price}")
             return {
                 "success": True,
                 "action": "BUY",
                 "symbol": symbol,
                 "quantity": quantity,
                 "execution_price": execution_price,
+                "fee_usd": round(buy_fee_usd, 4),
                 "new_balance": new_balance,
                 "avg_entry_price": round(new_avg_price, 4),
                 "remaining_cash": round(current_usdt_cash - trade_value_usd, 2)
@@ -249,7 +268,7 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
 
         elif action == "SELL":
             cursor.execute(
-                "SELECT quantity FROM portfolio WHERE blockchain = ? AND token = ?",
+                "SELECT quantity, avg_entry_price FROM portfolio WHERE blockchain = ? AND token = ?",
                 (blockchain, token)
             )
             balance_row = cursor.fetchone()
@@ -258,7 +277,11 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
             if quantity > current_token_holdings:
                 return {"success": False, "error": f"Attempting to liquidate more {token} than currently held on ledger."}
 
-            usdt_gained = quantity * execution_price
+            # v1.3: taker fee on exits - USDT credited net of fee.
+            gross_gained = quantity * execution_price
+            sell_fee_usd = gross_gained * TAKER_FEE
+            usdt_gained = gross_gained - sell_fee_usd
+            entry_basis = float(balance_row["avg_entry_price"]) if balance_row else 0.0
 
             cursor.execute(
                 "UPDATE portfolio SET quantity = quantity + ? WHERE blockchain = 'ARBITRUM' AND token = 'USDT'",
@@ -279,12 +302,28 @@ def evaluate_and_execute_simulated_trade(symbol, action, quantity, execution_pri
                 final_holdings = current_token_holdings - quantity
 
             conn.commit()
+
+            # v1.3: every realized exit becomes a realized_round_trips row so
+            # the brains' Kelly priors can be replaced by honest history. Exit
+            # is recorded fee-net; entry basis was stored fee-inclusive on buys
+            # post-v1.3 (legacy rows are off by at most one 0.1% fee).
+            if rrt is not None and entry_basis > 0:
+                rrt.record_trip(
+                    asset_class="CRYPTO", symbol=symbol, qty=quantity,
+                    entry_price=entry_basis,
+                    exit_price=execution_price * (1.0 - TAKER_FEE),
+                    reason=reason, basis="ledger_exact",
+                    db_path=DEFAULT_DB_PATH
+                )
+
+            logger.info(f"[ledger] SELL {symbol} ${gross_gained:.2f} gross - ${sell_fee_usd:.2f} taker fee @ ${execution_price}")
             return {
                 "success": True,
                 "action": "SELL",
                 "symbol": symbol,
                 "quantity": quantity,
                 "execution_price": execution_price,
+                "fee_usd": round(sell_fee_usd, 4),
                 "new_balance": final_holdings,
                 "avg_entry_price": 0.0 if final_holdings == 0.0 else balance_row["avg_entry_price"],
                 "remaining_cash": round(current_usdt_cash + usdt_gained, 2)

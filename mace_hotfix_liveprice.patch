@@ -1,0 +1,21 @@
+diff --git a/crypto/swarm/orchestrator.py b/crypto/swarm/orchestrator.py
+index f4bfd63..6271492 100755
+--- a/crypto/swarm/orchestrator.py
++++ b/crypto/swarm/orchestrator.py
+@@ -94,7 +94,15 @@ async def fetch_live_fill_price(pair, fallback_price):
+             if last and last > 0:
+                 return last
+         finally:
+-            await exchange.close()
++            # v1.1.1 hotfix: sync ccxt close() returns None (not awaitable) - awaiting it
++            # raised TypeError in the finally block, clobbering the return value and
++            # forcing 100% of live-price fetches to fall back to stale brain prices.
++            try:
++                maybe = exchange.close()
++                if asyncio.iscoroutine(maybe) or asyncio.isfuture(maybe):
++                    await maybe
++            except Exception:
++                pass
+     except Exception as e:
+         logger.warning(f"[!] Live fill price fetch failed for {pair} ({e}); using brain price.")
+     return float(fallback_price) if fallback_price else 0.0

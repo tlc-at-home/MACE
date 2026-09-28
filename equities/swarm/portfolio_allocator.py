@@ -20,6 +20,28 @@ def get_active_cooldowns():
             sys.stderr.write(f"[!] Cooldown lookup exception: {e}\n")
     return cooldowns
 
+def get_recent_cooldown_expiries(window_hours=72):
+    """v1.1: symbols whose cooldown expired within the last N hours (probation window).
+    Closes the mechanical 'cooldown expired -> rebuy same name next sweep' churn loop
+    that produced ~547 buy requests/day on the equity book."""
+    probation = set()
+    if os.path.exists(DB_PATH):
+        try:
+            from datetime import datetime, timedelta
+            now = datetime.utcnow()
+            now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            window_str = (now - timedelta(hours=window_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                rows = cursor.execute(
+                    "SELECT DISTINCT symbol FROM trade_cooldowns WHERE cooldown_until <= ? AND cooldown_until >= ?",
+                    (now_str, window_str)
+                ).fetchall()
+                probation = {r[0] for r in rows}
+        except Exception as e:
+            sys.stderr.write(f"[!] Probation lookup exception: {e}\n")
+    return probation
+
 def run_portfolio_guardrail():
     try:
         input_str = sys.stdin.read()
@@ -35,6 +57,13 @@ def run_portfolio_guardrail():
         existing_positions = payload.get("existing_positions", [])
 
         active_cooldowns = get_active_cooldowns()
+        probation_symbols = get_recent_cooldown_expiries(72)
+
+        # v1.1: hard cap on single-name risk. The brain's Kelly inputs are hardcoded
+        # placeholder stats (win rates 0.55-0.56) with zero realized-trade evidence,
+        # so full-Kelly 20% weights are not defensible. Cap at 12% (env-overridable)
+        # until honest stats are computed from mcp_execution_log realized rounds.
+        kelly_hard_cap = float(os.environ.get("KELLY_HARD_CAP", "0.12"))
 
         approved_trades = []
         trim_sell_orders = []
@@ -60,12 +89,34 @@ def run_portfolio_guardrail():
                 sys.stderr.write(f"[*] [{symbol}] Rejected: Asset in post-liquidation cooldown until {active_cooldowns[symbol]['cooldown_until']}\n")
                 continue
 
+            # v1.1 BEAR-FLIP LIQUIDATION: a HELD position whose regime flipped to Bear
+            # gets a full liquidation sell order. Must run BEFORE the Bull-only filter
+            # below (Bear candidates are dropped there). Previously the allocator only
+            # ever emitted profit-taking TRIMs for holdings - combined with the
+            # unregistered mcp_alpaca_close_position tool this left the book fully
+            # long through regime breakdowns (zero SELL rows ever recorded).
+            if symbol in existing_positions and current_state == "Bear":
+                trim_sell_orders.append({
+                    "symbol": symbol,
+                    "action": "BEAR_REGIME_LIQUIDATION",
+                    "reason": f"Regime flipped to Bear on {symbol}; liquidate full position"
+                })
+                sys.stderr.write(f"[!!!] [{symbol}] BEAR REGIME FLIP: emitting full liquidation sell order.\n")
+                continue
+
             if not ml_confirmed or current_state != "Bull" or calculated_kelly < 0.05:
+                continue
+
+            # v1.1 PROBATION GATE: symbols that stopped out within the last 72h must
+            # show double conviction (kelly >= 0.10) to re-enter. Blocks mechanical
+            # rebuys of just-stopped names while still allowing genuine fresh momentum.
+            if symbol in probation_symbols and calculated_kelly < 0.10:
+                sys.stderr.write(f"[*] [{symbol}] Rejected: post-stopout 72h probation (kelly {calculated_kelly:.3f} < 0.10)\n")
                 continue
 
             # Routine Profit-Taking / Weight Audit for existing holdings
             if symbol in existing_positions:
-                target_allocation_fraction = min(calculated_kelly, 0.20)
+                target_allocation_fraction = min(calculated_kelly, kelly_hard_cap)
                 target_usd = total_equity * target_allocation_fraction
                 # Use existing_positions dict which maps symbol to market_value
                 current_val = float(existing_positions[symbol]) if isinstance(existing_positions, dict) else target_usd
@@ -95,10 +146,16 @@ def run_portfolio_guardrail():
         # 2. Capital Allocation Pass: Raw Kelly Sizing based strictly on Total Equity
         total_requested_fraction = 0.0
         for trade in approved_trades:
-            # Enforce hard asset-level ceiling constraint (Max 20% allocation per single trade)
-            allocated_fraction = min(trade["calculated_kelly"], 0.20)
+            # Enforce hard asset-level ceiling constraint (v1.1: capped at kelly_hard_cap)
+            allocated_fraction = min(trade["calculated_kelly"], kelly_hard_cap)
             trade["allocated_fraction"] = allocated_fraction
-            trade["target_size_usd"] = total_equity * allocated_fraction
+            # v1.3.2: Alpaca notional orders reject values with more than 2 decimal
+            # places (HTTP 42210000 "notional value must be limited to 2 decimal
+            # places"). Round at the source so every downstream path (direct buys,
+            # TRIM sells, recovery retries, mcp_requested_trades.amount_usd records)
+            # receives a broker-clean number. The normalization pass below already
+            # rounds, but the no-normalization branch (line 158 else) skipped it.
+            trade["target_size_usd"] = round(total_equity * allocated_fraction, 2)
             total_requested_fraction += allocated_fraction
 
         # 3. Portfolio Normalization Pass (The Budget Constraint)

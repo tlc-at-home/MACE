@@ -89,11 +89,12 @@ The TradFi pipeline operates on a periodic cycle (1h intervals in daemon mode), 
    - Rolling 20-day returns and 20-day volatility.
    - An empirical Markov transition matrix mapping historical state transitions (Bull, Bear, Sideways).
    - An independent **3-State Gaussian Hidden Markov Model (HMM)** fitted on returns and volatility to "confirm" the market regime.
-   - A **Dynamic Half-Kelly Sizing** parameter based on backtested historical win-rates, scaled by signal strength (a Sharpe ratio proxy) and capped at 25%.
+   - A **Dynamic Half-Kelly Sizing** parameter. ⚠️ *Truth pass (v1.3)*: the win-rate/payoff priors are **hardcoded constants, not backtested values** (a prior audit found no backtest exists). Since v1.3 they are shrinkage-blended with **realized round-trip history** (see `realized_round_trips` table and `MACE_EMPIRICAL_KELLY_JSON`) — until at least `MACE_KELLY_MIN_ROUNDS` (default 10) realized exits exist, the priors remain in force. Sizing is scaled by signal strength (a Sharpe ratio proxy) and capped at 25%.
 3. **Portfolio Allocator ([portfolio_allocator.py](file:///mnt/MACE/equities/swarm/portfolio_allocator.py))**: Takes the outputs of all candidate brains, filters out assets not confirmed to be in a "Bull" regime, clamps individual trade sizes to a maximum of 20% of total equity, and normalizes positions to fit within a 90% deployable cash limit.
 4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/equities/swarm/orchestrator.py))**: Manages the pipeline workflow. When trades are approved:
-   - **Sell orders** are submitted first via an autonomous Google Antigravity Agent (Gemini 2.5 Flash) connected to an `alpaca-mcp-server` command.
-   - **Buy orders** are placed next using the same agent, executing market orders based on the computed sizing in USD.
+   - **Sell orders** are dispatched first via the direct `BrokerClient` path (`TRIM_PROFIT_TAKING` sells as market orders; full liquidations via `close_position`). The legacy Gemini-agent sell path referenced a tool that was never registered and was removed in v1.1.
+   - **Buy orders** are placed next via the Alpaca paper REST API directly (default `MACE_BUY_DISPATCH=direct`, v1.2). The legacy Gemini agent dispatch (`MACE_BUY_DISPATCH=agent`) is retained as an escape hatch.
+   - **News-guard fail-neutral gate (v1.3)**: if the TradFi news guard has not completed a fresh, healthy audit within `MACE_NEWS_STALENESS_HOURS` (default 12h), new entries are **held** (sells, trims, stop-outs and liquidations stay fully live). Set `MACE_NEWS_GATE=off` to restore the legacy fail-open behavior.
    - Emits structured state telemetry to the local MQTT broker.
 
 ### B. Crypto Swarm
@@ -105,7 +106,9 @@ The crypto pipeline is designed around a simulated multi-chain sandbox and runs 
    - Simulated wallet public keys and gas balances for Solana and Arbitrum.
    - Active coin balances, average entry prices, and available USDT cash (initialized at $10,000 USDT).
    - Applies portfolio constraints (max 25% single-asset exposure, min $10 trade sizing) and executes simulated BUY/SELL trades directly against the DB ledger.
-4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/crypto/swarm/orchestrator.py))**: Loops through the crypto universe on UTC HH:05:00 boundaries, pipes OHLCV data into the brain subprocesses concurrently (capped with a semaphore of 10), evaluates results through the Guardrail, and dispatches telemetry.
+   - **Taker fee (v1.3)**: fills are charged a configurable taker fee (default 0.1% = `MACE_TAKER_FEE`) — buys store a fee-inclusive cost basis, sells credit USDT net of fee — so simulated P&L tracks what a real spot account would realize. The crypto shield applies the same fee on stop-out exits (its settlement path bypasses the guardrail).
+   - **Realized round trips (v1.3)**: every completed exit writes a `realized_round_trips` row feeding the empirical Kelly stats.
+4. **Orchestrator ([orchestrator.py](file:///mnt/MACE/crypto/swarm/orchestrator.py))**: Loops through the crypto universe on UTC HH:05:00 boundaries, pipes OHLCV data into the brain subprocesses concurrently (capped with a semaphore of 10), evaluates results through the Guardrail, and dispatches telemetry. Ledger fills mark to a **venue pool** (default KuCoin → Binance → Bybit, `MACE_PRICE_VENUES`, v1.3) so a single-venue outage can no longer revert entries to the brain's stale 4h closes. Each sweep also purges virtual-ledger rows that no venue can price for `MACE_STALE_LEDGER_SWEEPS` (default 3) consecutive sweeps (stale-ledger write-down, recorded as a −100% round trip).
 
 ---
 
@@ -116,7 +119,7 @@ M.A.C.E. implements three parallel, asynchronous risk mitigation layers to prote
 ### I. Volatility-Calibrated Crypto Shield ([crypto_shield.py](file:///mnt/MACE/crypto/crypto_shield.py))
 * **Interval**: Runs every 15 minutes as a systemd service.
 * **Mechanism**: Pulls active holdings from `portfolio.db`, fetches live spot prices via CCXT (KuCoin with Binance failover), and queries the `crypto_hwm` table.
-* **Rule**: Enforces a dynamic, volatility-calibrated trailing stop-loss (calibrated by the scout between a tight **3.0% and 8.0% limit** based on 3-Sigma historical log returns of 1h candles over 30 days).
+* **Rule**: Enforces a dynamic, volatility-calibrated trailing stop-loss. Since v1.2 the per-position limit is recalibrated daily from genuine volatility: equities use a 20-day daily-bar basis (5%–12% corridor, clamped), crypto uses a 1-minute-bar trailing-24h basis (6%–16% corridor, clamped) — replacing the old static 8% (equities) and the 3–8% scout calibration (crypto).
 * **Action**: If the drawdown from the High-Water Mark (HWM) breaches the limit, liquidates the position, resets HWM tracking, and returns recovered cash to the USDT wallet. Dynamically ratchets the HWM up if prices set new peaks.
 
 ### II. Deterministic TradFi Shield ([tradfi_shield.py](file:///mnt/MACE/equities/tradfi_shield.py))
@@ -130,10 +133,11 @@ M.A.C.E. implements three parallel, asynchronous risk mitigation layers to prote
 * **Mechanism**: Leverages LLMs to evaluate unstructured risk factors.
 * **Workflow**:
   1. Fetches current Alpaca stock holdings.
-  2. Queries the Alpaca Data API for the top 10 latest news headlines for those stocks.
+  2. Aggregates recent headlines for held positions from **Yahoo Finance RSS** (⚠️ *truth pass*: this is the actual source in code — earlier revisions of this README claimed the Alpaca Data API news feed).
   3. Hands the aggregated context to a Gemini 2.5 Flash agent.
   4. The agent acts as an autonomous qualitative analyst, ignoring normal volatility but scanning for **existential threats** (e.g., bankruptcy, SEC fraud investigations, catastrophic product failures, CEO arrests).
-  5. If a severe threat is found, the agent uses the `alpaca-mcp-server` to execute `mcp_alpaca_close_position` for that symbol immediately.
+  5. If a severe threat is found, the agent calls the guard's own `close_position_tool` for that symbol immediately (which also registers a 24h `QUALITATIVE_NEWS_THREAT` cooldown row).
+  6. **Health heartbeat (v1.3)**: every audit cycle upserts a `component_health` row (`healthy` / `degraded` / `idle`). The equities orchestrator's fail-neutral buy gate reads it — while the sensor is blind (e.g. the Gemini key is rate-capped), new buys are held instead of silently proceeding as if every audit had come back clean.
 
 ---
 
@@ -218,3 +222,25 @@ graph TD
 - **`MACEPostToolCallHook`**: Logs the tool execution status, parameters, and result to `mcp_execution_log` (linked via `trade_id` foreign key) and updates the matching request status to `COMPLETED` or `FAILED`.
 - **`MACEToolErrorHook`**: Intercepts unhandled tool exceptions and registers them as `FAILED` execution records.
 
+---
+
+## 8. v1.3 Operational Reference (Environment Variables)
+
+All v1.3 behavior is env-tunable with safe defaults; no configuration is required to deploy the patch.
+
+| Variable | Default | Scope | Effect |
+| :--- | :--- | :--- | :--- |
+| `MACE_NEWS_GATE` | `on` | equities orchestrator | `on` = fail-neutral buy gate while the news guard is stale/degraded; `off` = legacy fail-open |
+| `MACE_NEWS_STALENESS_HOURS` | `12` | news gate | A healthy audit older than this counts as blind (3× the 4h audit cadence) |
+| `MACE_TAKER_FEE` | `0.001` | guardrail + crypto shield | Virtual-ledger taker fee (fraction, not percent) applied to entries and exits |
+| `MACE_KELLY_MIN_ROUNDS` | `10` | both orchestrators | Minimum realized exits before empirical stats override priors |
+| `MACE_KELLY_LOOKBACK` | `100` | both orchestrators | Round trips aggregated into the empirical edge stats |
+| `MACE_PRICE_VENUES` | `kucoin,binance,bybit` | crypto orchestrator/shield pool | Ordered venue pool for live fills and the priceability oracle |
+| `MACE_STALE_LEDGER_SWEEPS` | `3` | crypto orchestrator | Consecutive unpriceable sweeps before a ledger row is written down |
+| `MACE_BUY_DISPATCH` | `direct` | equities orchestrator | `direct` = Alpaca REST; `agent` = legacy Gemini dispatch (escape hatch) |
+| `MACE_REGIME_COOLDOWN_HOURS` | `24` | crypto orchestrator | Re-entry lock after a Bear-regime RISK-OFF liquidation |
+| `MACE_EMPIRICAL_KELLY_JSON` | *(set per sweep)* | both brains | Internal side channel carrying empirical stats into the brain subprocesses — do not set manually |
+
+**New tables (auto-created, idempotent)**: `realized_round_trips` (per-exit P&L records; `basis` = `ledger_exact` crypto / `dispatch_approx` equities) and `component_health` (heartbeat store powering the fail-neutral gate).
+
+**New shared modules**: `realized_round_trips.py` (round-trip store + empirical Kelly stats + news-guard health) and `price_venues.py` (multi-venue live-price pool) at the repo root.
